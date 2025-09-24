@@ -1,337 +1,453 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-from datetime import datetime
-from pathlib import Path
-import hashlib
-import io
-
-# --- Language Translations (English/Chinese) ---
-if "lang" not in st.session_state:
-    st.session_state["lang"] = "en"
-lang = st.sidebar.selectbox("🌐 Language", ["English", "中文"], index=0 if st.session_state["lang"]=="en" else 1)
-st.session_state["lang"] = "en" if lang=="English" else "zh"
-
-translations = {
-    "en": {
-        "supplier_shipments": "🚚 Supplier Shipments",
-        "add_skus": "Add one or more SKUs for this shipment.",
-        "tracking_number": "Tracking Number",
-        "carrier": "Carrier Name",
-        "destination_hub": "Destination Hub",
-        "shipping_date": "Shipping Date",
-        "sku": "SKU",
-        "qty": "Qty",
-        "remove": "Remove",
-        "add_another_sku": "Add Another SKU",
-        "create_new_sku": "➕ Create New SKU",
-        "new_sku_name": "New SKU Name",
-        "add_sku": "Add SKU",
-        "submit_shipment": "Submit Shipment",
-        "shipment_submitted": "Shipment submitted successfully!",
-        "fill_out_required": "Please fill out all required fields and SKUs.",
-        "your_shipments": "📦 Your Shipments",
-        "no_shipments": "You have not submitted any shipments yet.",
-        "incoming_shipments": "📦 Incoming Shipments to Your Hub",
-        "mark_received": "Mark Shipment as Received",
-        "confirm_receipt": "Confirm receipt of shipment",
-        "delete_shipment": "Delete Shipment",
-        "confirm_delete": "Confirm delete shipment",
-        "shipment_deleted": "Shipment deleted.",
-        "shipment_confirmed": "Shipment confirmed received and inventory updated.",
-        "restock_orders": "🔄 Restock Orders",
-        "create_user": "➕ Create User",
-        "user_created": "User created successfully!",
-        "select_user": "Select User",
-        "remove_user": "Remove User",
-        "confirm_remove_user": "Really remove",
-        "user_removed": "User removed.",
-        "backup": "🗄️ Backup Database",
-        "restore": "🔄 Restore Database",
-        "download_backup": "Download Backup CSV",
-        "upload_csv": "Upload CSV for Restore",
-        "count_confirmed": "Count confirmed.",
-        "refresh": "Refresh",
-        "update_inventory": "Update Inventory",
-        "select_sku": "Select SKU",
-        "action": "Action",
-        "quantity": "Quantity",
-        "optional_comment": "Optional Comment",
-        "submit_update": "Submit Update",
-        "bulk_update": "Bulk Inventory Update",
-        "adjust_quantity": "Adjust Quantity (+IN / -OUT)",
-        "comment": "Comment",
-        "apply_updates": "Apply All Updates",
-        "sku_exists": "SKU already exists!",
-        "enter_sku_name": "Please enter a SKU name.",
-        "create_sku": "Create SKU",
-        "upload_skus": "Upload SKUs from CSV",
-        "assign_skus": "Assign SKUs to Hubs",
-        "select_sku_assign": "Select SKU to Assign",
-        "assign_to_hubs": "Assign to Hubs",
-        "update_assignments": "Update Assignments",
-        "assignment_updated": "SKU assignment updated!",
-        "manage_users": "Manage Users",
-        "username": "Username",
-        "role": "Role",
-        "hub": "Hub",
-        "send_message": "Send Message",
-        "to": "To",
-        "subject": "Subject",
-        "message": "Message",
-        "send": "Send",
-        "your_threads": "Your Threads",
-        "reply": "Reply",
-        "send_reply": "Send Reply",
-        "only_reply_hq": "Only reply to HQ is allowed.",
-        "activity_logs": "Activity Logs",
-        "filter_logs": "Filter logs",
-        "inventory_count_mode": "Inventory Count Mode",
-        "confirmed_counts": "Confirmed Counts",
-        "export_inventory": "Export Inventory",
-    },
-    "zh": {
-        "supplier_shipments": "🚚 供应商发货",
-        "add_skus": "为此发货添加一个或多个SKU。",
-        "tracking_number": "追踪号码",
-        "carrier": "承运人名称",
-        "destination_hub": "目的中心",
-        "shipping_date": "发货日期",
-        "sku": "SKU",
-        "qty": "数量",
-        "remove": "移除",
-        "add_another_sku": "添加另一个SKU",
-        "create_new_sku": "➕ 新建SKU",
-        "new_sku_name": "新SKU名称",
-        "add_sku": "添加SKU",
-        "submit_shipment": "提交发货",
-        "shipment_submitted": "发货已成功提交！",
-        "fill_out_required": "请填写所有必填字段和SKU。",
-        "your_shipments": "📦 您的发货记录",
-        "no_shipments": "您还没有提交任何发货。",
-        "incoming_shipments": "📦 您中心的待发货记录",
-        "mark_received": "标记发货为已收到",
-        "confirm_receipt": "确认收货",
-        "delete_shipment": "删除发货",
-        "confirm_delete": "确认删除发货",
-        "shipment_deleted": "发货已删除。",
-        "shipment_confirmed": "发货已确认收到，库存已更新。",
-        "restock_orders": "🔄 补货订单",
-        "create_user": "➕ 创建用户",
-        "user_created": "用户创建成功！",
-        "select_user": "选择用户",
-        "remove_user": "删除用户",
-        "confirm_remove_user": "确认删除",
-        "user_removed": "用户已删除。",
-        "backup": "🗄️ 数据库备份",
-        "restore": "🔄 数据库恢复",
-        "download_backup": "下载备份CSV",
-        "upload_csv": "上传CSV以恢复",
-        "count_confirmed": "库存盘点已确认。",
-        "refresh": "刷新",
-        "update_inventory": "更新库存",
-        "select_sku": "选择SKU",
-        "action": "操作",
-        "quantity": "数量",
-        "optional_comment": "可选备注",
-        "submit_update": "提交更新",
-        "bulk_update": "批量库存更新",
-        "adjust_quantity": "调整数量（+入库 / -出库）",
-        "comment": "备注",
-        "apply_updates": "应用所有更新",
-        "sku_exists": "SKU已存在！",
-        "enter_sku_name": "请输入SKU名称。",
-        "create_sku": "创建SKU",
-        "upload_skus": "从CSV上传SKU",
-        "assign_skus": "分配SKU到仓库",
-        "select_sku_assign": "选择要分配的SKU",
-        "assign_to_hubs": "分配到仓库",
-        "update_assignments": "更新分配",
-        "assignment_updated": "SKU分配已更新！",
-        "manage_users": "管理用户",
-        "username": "用户名",
-        "role": "角色",
-        "hub": "仓库",
-        "send_message": "发送消息",
-        "to": "收件人",
-        "subject": "主题",
-        "message": "消息",
-        "send": "发送",
-        "your_threads": "您的会话",
-        "reply": "回复",
-        "send_reply": "发送回复",
-        "only_reply_hq": "只能回复总部。",
-        "activity_logs": "活动日志",
-        "filter_logs": "筛选日志",
-        "inventory_count_mode": "库存盘点模式",
-        "confirmed_counts": "已确认盘点",
-        "export_inventory": "导出库存",
-    }
-}
-
-def T(key): return translations[st.session_state["lang"]].get(key, key)
+# ===== app.py — KISS Inventory =====
 import os
+from pathlib import Path
+import sqlite3
+from datetime import datetime, date, timedelta
+from typing import Optional, Dict, List, Tuple
+
+import streamlit as st
+import pandas as pd
+
+# --- Config: DB path (env var or local file)
 DB = Path(os.getenv("TTT_DB_PATH", Path(__file__).parent / "ttt_inventory.db"))
 
-# --- Safety: backup the SQLite DB before destructive operations ---
-from datetime import datetime
-import shutil
-def backup_db() -> Path:
+# --- DB helpers ---------------------------------------------------------------
+def connect():
+    con = sqlite3.connect(str(DB))
+    # KISS but safe/fast enough
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+def query(sql: str, params: Tuple = (), fetch: bool = True, commit: bool = False):
+    con = connect()
+    cur = con.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall() if fetch else None
+    if commit:
+        con.commit()
+    con.close()
+    return rows
+
+def execmany(sql: str, rows: List[Tuple]):
+    con = connect()
+    cur = con.cursor()
+    cur.executemany(sql, rows)
+    con.commit()
+    con.close()
+
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+# --- Safety: backup the SQLite DB before destructive operations
+def backup_db() -> Optional[Path]:
     try:
         db_path = Path(DB)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = db_path.with_name(f"{db_path.stem}-{ts}{db_path.suffix}")
+        import shutil
         shutil.copy2(db_path, backup)
         return backup
-    except Exception as e:
+    except Exception:
         return None
 
-
-
-# --- Password hashing helpers (bcrypt with SHA-256 fallback for legacy rows) ---
+# ===== section 2: auth (bcrypt + legacy), users table, seeding ================
 try:
     import bcrypt
 except Exception:
     bcrypt = None
 
 def hash_password(pw: str) -> str:
-    """
-    Preferred hash: bcrypt. Fallback to sha256 hex if bcrypt unavailable.
-    """
     if bcrypt:
         return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
     import hashlib
     return hashlib.sha256(pw.encode()).hexdigest()
 
 def verify_password(plain: str, stored: str) -> bool:
-    """
-    Accept both bcrypt hashes and legacy sha256 hex. If sha256 matches and bcrypt is available,
-    upgrade the row to bcrypt at next successful login (done in login()).
-    """
-    if stored and stored.startswith("$2b$"):
+    # bcrypt hash?
+    if stored and stored.startswith("$2"):
         if not bcrypt:
             return False
         try:
             return bcrypt.checkpw(plain.encode(), stored.encode())
         except Exception:
             return False
-    # legacy sha256 hex (64 chars, hex)
+    # legacy sha256 (64 hex)
     import re, hashlib
-    if re.fullmatch(r"[0-9a-f]{64}", stored):
+    if re.fullmatch(r"[0-9a-f]{64}", stored or ""):
         return hashlib.sha256(plain.encode()).hexdigest() == stored
-    # unknown format
     return False
-def query(sql, params=(), fetch=True, commit=True):
-    with sqlite3.connect(DB) as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        if commit: conn.commit()
-        return cur.fetchall() if fetch else None    
 
-# --- Seed Data (SKUs & Users) ---
-def seed_all_skus():
-    hub_assignments = {
-        "Hub 1": ["All American Stripes", "Carolina Blue and White Stripes", "Navy and Silver Stripes",
-                  "Black and Hot Pink Stripes", "Bubble Gum and White Stripes", "White and Ice Blue Stripes",
-                  "Imperial Purple and White Stripes", "Hot Pink and White Stripes", "Rainbow Stripes",
-                  "Twilight Pop", "Juicy Purple", "Lovely Lilac", "Black", "Black and White Stripes"],
-        "Hub 2": ["Black and Yellow Stripes", "Orange and Black Stripes", "Black and Purple Stripes",
-                  "Black and Orange Stripes", "Electric Blue and White Stripes", "Blossom Breeze", "Candy Cane Stripes",
-                  "Plum Solid", "Patriots (Custom)", "Snow Angel (Custom)", "Cranberry Frost (Custom)", "Witchy Vibes",
-                  "White and Green Stripes", "Black Solid", "Black and White Stripes"],
-        "Hub 3": ["Black and Grey Stripes", "Black and Green Stripes", "Smoke Grey and Black Stripes",
-                  "Black and Red Stripes", "Black and Purple", "Dark Cherry and White Stripes", "Black and Multicolor Stripes",
-                  "Puerto Rican (Custom)", "Seahawks (Custom)", "PCH (Custom)", "Valentine Socks",
-                  "Rainbow Stripes", "Thin Black Socks", "Thin Black and White Stripes", "Smoke Grey Solid", "Cherry Solid",
-                  "Brown Solid", "Wheat and White Stripes", "Black Solid", "Black and White Stripes"]
-    }
-    retail_skus = [
-        "Black Solid", "Bubblegum", "Tan Solid", "Hot Pink Solid", "Brown Solid", "Dark Cherry Solid",
-        "Winter White Solid", "Coral Orange", "Navy Solid", "Electric Blue Solid", "Celtic Green",
-        "Cherry Solid", "Smoke Grey Solid", "Chartreuse Green", "Lovely Lilac", "Carolina Blue Solid",
-        "Juicy Purple", "Green & Red Spaced Stripes", "Winter Green Stripes", "Midnight Frost Stripes",
-        "Witchy Vibes Stripes", "Light Purple & White Spaced Stripes", "Peppermint Stripes",
-        "Red & Black Spaced Stripes", "Gothic Chic Stripes", "Sugar Rush Stripes", "Emerald Onyx Stripes",
-        "Pumpkin Spice Stripes", "Pink & White Spaced Stripes", "All American Stripes",
-        "Candy Cane Stripes", "Blossom Breeze", "White and Ice Blue Stripes", "Christmas Festive Stripes",
-        "White w/ Black stripes", "Navy w/ White stripes", "Cyan w/ White stripes",
-        "Celtic Green and White Stripes", "Twilight Pop", "Black and Multicolor Stripes",
-        "Black w/ Pink stripes", "Black and Yellow Stripes", "BHM", "Solar Glow", "Navy and Silver Stripes",
-        "Cherry and White Stripes", "Wheat and White Stripes", "Brown w/ White stripes",
-        "White and Green Stripes", "Coral w/ White stripes", "Imperial Purple and White Stripes",
-        "Carolina Blue and White Stripes", "Smoke Grey and White Stripes", "Black w/ White stripes",
-        "Bubble Gum and White Stripes", "Dark Cherry and White Stripes", "Hot Pink w/ White stripes",
-        "Orange and Black Stripes", "Black and Orange Stripes", "Black w/Red stripes",
-        "Smoke Grey w/Black Stripes", "Royal Blue solid", "Black w/Grey stripes", "Black w/Purple stripes",
-        "Black w/Rainbow Stripes", "Black and Green Stripes", "Heart Socks", "Shamrock Socks",
-        "Plum Solid", "Pumpkin Solid", "PCH", "Cranberry Frost", "Snowy Angel", "Pats", "Seahawks",
-        "Black solid (THN)", "White solid (THN)", "Black w/ White stripes (THN)", "Yellow (THN)",
-        "Black w/Red stripes (THN)", "Black w/Pink stripes (THN)", "Hot Pink w/White stripes (THN)",
-        "Black Solid (SHORT)", "White Solid (SHORT)", "Black and White Stripes (SHORT)"
-    ]
-    all_skus = set(retail_skus)
-    for hub_list in hub_assignments.values():
-        all_skus.update(hub_list)
-    for sku in sorted(all_skus):
-        assigned = [hub for hub, skus in hub_assignments.items() if sku in skus]
-        if sku in retail_skus:
-            assigned.append("Retail")
-        query(
-            "INSERT OR REPLACE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?, ?, ?)",
-            (sku, sku, ",".join(sorted(set(assigned)))),
-            fetch=False,
-            commit=True
-        )
-        for h in assigned:
-            query(
-                "INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)",
-                (sku, h, 0),
-                fetch=False,
-                commit=True
-            )
-
-def seed_users():
-    users = [
-        ("kevin", "Admin", "HQ", "adminpass"),
-        ("fox", "Hub Manager", "Hub 2", "foxpass"),
-        ("smooth", "Retail", "Retail", "retailpass"),
-        ("carmen", "Hub Manager", "Hub 3", "hub3pass"),
-        ("slo", "Hub Manager", "Hub 1", "hub1pass"),
-        ("angie", "Supplier", "", "shipit")
-    ]
-    for u, r, h, p in users:
-        pw = hash_password(p)
-        query(
-            "INSERT OR IGNORE INTO users (username, password, role, hub) VALUES (?, ?, ?, ?)",
-            (u, pw, r, h),
-            fetch=False,
-            commit=True
-        )
-
-def create_tables():
-    query("""CREATE TABLE IF NOT EXISTS users (
+def ensure_users_schema_and_seed():
+    con = connect(); cur = con.cursor()
+    # Create table if missing (original columns)
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
         password TEXT,
         role TEXT,
-        hub TEXT)""", fetch=False, commit=True)
-    query("""CREATE TABLE IF NOT EXISTS inventory (
-        sku TEXT,
+        hub TEXT
+    )""")
+    # MIGRATION: add 'disabled' column if missing
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+    if "disabled" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN disabled INTEGER DEFAULT 0")
+        cur.execute("UPDATE users SET disabled=0 WHERE disabled IS NULL")
+    # Seed only if empty
+    cur.execute("SELECT COUNT(*) FROM users")
+    n = cur.fetchone()[0]
+    if n == 0:
+        seed = [
+            ("kevin",   hash_password("adminpass"),  "Admin",       "HQ",    0),
+            ("fox",     hash_password("foxpass"),    "Hub Manager", "Hub 2", 0),
+            ("smooth",  hash_password("retailpass"), "Retail",      "Retail",0),
+            ("carmen",  hash_password("hub3pass"),   "Hub Manager", "Hub 3", 0),
+            ("slo",     hash_password("hub1pass"),   "Hub Manager", "Hub 1", 0),
+            ("angie",   hash_password("shipit"),     "Supplier",    None,    0),
+        ]
+        cur.executemany("INSERT INTO users (username,password,role,hub,disabled) VALUES (?,?,?,?,?)", seed)
+    con.commit(); con.close()
+
+ensure_users_schema_and_seed()
+
+def is_admin(role: str) -> bool:
+    return (role or "").lower() == "admin"
+
+def get_role(username: str) -> Optional[str]:
+    r = query("SELECT role FROM users WHERE username=?", (username,))
+    return (r[0][0] if r else None)
+
+def login(username: str, password: str):
+    rows = query("SELECT username, password, role, hub, disabled FROM users WHERE username=?", (username,))
+    if not rows:
+        return None
+    uname, stored_hash, role, hub, disabled = rows[0]
+    if disabled:
+        return None
+    if verify_password(password, stored_hash):
+        # auto-upgrade legacy sha256 to bcrypt
+        if bcrypt and stored_hash and not stored_hash.startswith("$2"):
+            try:
+                new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+                query("UPDATE users SET password=? WHERE username=?", (new_hash, username), fetch=False, commit=True)
+            except Exception:
+                pass
+        # audit login
+        try:
+            ensure_logs_schema()
+            query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                  (_now_iso(), uname, None, hub, "login", None, f"role={role}"), fetch=False, commit=True)
+        except Exception:
+            pass
+        return (uname, role, hub)
+    return None
+
+def logout():
+    for k in ("auth_user", "logged_in"):
+        if k in st.session_state:
+            del st.session_state[k]
+
+def login_form():
+    st.subheader("Log in")
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+    if st.button("Sign in"):
+        user = login(u.strip(), p)
+        if user:
+            st.session_state["auth_user"] = user  # (username, role, hub)
+            st.session_state["logged_in"] = True
+            st.rerun()
+        else:
+            st.error("Invalid credentials or user disabled")
+
+# ===== section 3: messaging core =============================================
+def ensure_messages_schema():
+    con = connect(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        sender TEXT,
+        recipient TEXT,
+        subject TEXT,
+        body TEXT,
+        thread_id TEXT,
+        msg_type TEXT,
+        read_at TEXT,
         hub TEXT,
-        quantity INTEGER,
-        PRIMARY KEY (sku, hub))""", fetch=False, commit=True)
-    query("""CREATE TABLE IF NOT EXISTS logs (
+        shipped_count INTEGER,
+        shipped_range_start TEXT,
+        shipped_range_end TEXT,
+        paid_count INTEGER,
+        meta TEXT
+    )""")
+    # Ensure columns exist
+    have = [r[1] for r in cur.execute("PRAGMA table_info(messages)").fetchall()]
+    required = {
+        "recipient":"TEXT","subject":"TEXT","body":"TEXT",
+        "thread_id":"TEXT","msg_type":"TEXT","read_at":"TEXT","hub":"TEXT",
+        "shipped_count":"INTEGER","shipped_range_start":"TEXT","shipped_range_end":"TEXT",
+        "paid_count":"INTEGER","meta":"TEXT"
+    }
+    for col, coltype in required.items():
+        if col not in have:
+            cur.execute(f"ALTER TABLE messages ADD COLUMN {col} {coltype}")
+    con.commit(); con.close()
+
+def unread_count(username: str) -> int:
+    try:
+        ensure_messages_schema()
+        row = query("SELECT COUNT(*) FROM messages WHERE recipient=? AND read_at IS NULL", (username,))
+        return int(row[0][0]) if row else 0
+    except Exception:
+        return 0
+
+def _guard_message_send(sender: str, recipient: str) -> None:
+    s_role = get_role(sender) or ""
+    r_role = get_role(recipient) or ""
+    # Non-admins may only send to Admins (HQ)
+    if (s_role or "").lower() != "admin" and (r_role or "").lower() != "admin":
+        raise ValueError("Only Admins (HQ) can be messaged by non-admin users.")
+
+def send_message(sender: str, recipient: str, subject: str, body: str,
+                 msg_type: str="message", thread_id: Optional[str]=None, hub: Optional[str]=None,
+                 shipped_count: Optional[int]=None, range_start: Optional[str]=None, range_end: Optional[str]=None,
+                 paid_count: Optional[int]=None, meta: Optional[str]=None):
+    import uuid
+    ensure_messages_schema()
+    # server-side guard
+    _guard_message_send(sender, recipient)
+    if not thread_id:
+        thread_id = str(uuid.uuid4())
+    query("""INSERT INTO messages (timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,
+                                   shipped_count,shipped_range_start,shipped_range_end,paid_count,meta)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (_now_iso(), sender, recipient, subject, body, thread_id, msg_type, None, hub,
+           shipped_count, range_start, range_end, paid_count, meta),
+          fetch=False, commit=True)
+    # audit
+    try:
+        ensure_logs_schema()
+        query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+              (_now_iso(), sender, None, hub, "message_sent", None,
+               f"to={recipient}|type={msg_type}|thread={thread_id}"),
+              fetch=False, commit=True)
+    except Exception:
+        pass
+    return thread_id
+
+def mark_thread_read(username: str, thread_id: str):
+    query("UPDATE messages SET read_at=? WHERE recipient=? AND thread_id=? AND read_at IS NULL",
+          (_now_iso(), username, thread_id), fetch=False, commit=True)
+
+def get_inbox(username: str, only_unread: bool=False):
+    ensure_messages_schema()
+    sql = "SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE recipient=?"
+    if only_unread:
+        sql += " AND read_at IS NULL"
+    sql += " ORDER BY timestamp DESC"
+    return query(sql, (username,))
+
+def get_sent(username: str):
+    ensure_messages_schema()
+    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE sender=? ORDER BY timestamp DESC",
+                 (username,))
+
+def get_thread(thread_id: str):
+    ensure_messages_schema()
+    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
+                 (thread_id,))
+
+def shipments_count_for(hub: str, start: str, end: str) -> int:
+    try:
+        rows = query("SELECT COUNT(*) FROM shipments WHERE hub=? AND date(date) BETWEEN date(?) AND date(?)",
+                     (hub, start, end))
+        return int(rows[0][0]) if rows else 0
+    except Exception:
+        return 0
+
+# ===== section 4: messaging UI page ==========================================
+def messaging_page(current_user: str, role: str, hub: Optional[str]):
+    st.header("💬 Messages")
+    top = st.columns([3,1])
+    with top[0]:
+        st.caption(f"Logged in as **{current_user}** ({role}{' — '+hub if hub else ''})")
+    with top[1]:
+        st.metric("Unread", unread_count(current_user))
+
+    is_admin_user = is_admin(role)
+
+    if is_admin_user:
+        tabs = st.tabs(["📥 Inbox","📤 Sent","✍️ Compose","📊 Reports"])
+    else:
+        tabs = st.tabs(["📥 Inbox","📨 Message HQ","📊 Reports"])
+
+    # --- inbox ---
+    with tabs[0]:
+        show_unread = st.checkbox("Show only unread", value=False)
+        inbox = get_inbox(current_user, only_unread=show_unread)
+        if not inbox:
+            st.info("No messages.")
+        else:
+            threads: Dict[str, list] = {}
+            for r in inbox:
+                threads.setdefault(r[6], []).append(r)
+            for tid, items in list(threads.items())[:100]:
+                latest = items[0]
+                unread = any(it[8] is None and it[3]==current_user for it in items)
+                label = f"{'🔵 ' if unread else ''}{latest[2]} • {latest[4]} • {latest[1]}"
+                with st.expander(label, expanded=False):
+                    for it in items[::-1]:
+                        _id, ts, snd, rcp, sub, body, _t, mtype, r_at, _hub, scnt, rs, re_, pcnt = it
+                        badge = "✉️"
+                        if mtype=="shipped_report": badge="🟣 Shipped"
+                        elif mtype=="paid_notice": badge="🟢 Paid"
+                        elif mtype=="dropoff_report": badge="🟠 Drop-off"
+                        st.markdown(f"**{snd} → {rcp}** · _{ts}_ · {badge}")
+                        st.write(body)
+                        if scnt is not None and (mtype in ("shipped_report","dropoff_report")):
+                            if rs and re_:
+                                st.caption(f"Count: {scnt} ({rs} → {re_})")
+                        if pcnt is not None: st.caption(f"Paid: {pcnt}")
+                        st.divider()
+                    cols = st.columns([1,2,2])
+                    if cols[0].button("Mark read", key=f"mr_{tid}"):
+                        mark_thread_read(current_user, tid); st.rerun()
+                    reply = cols[1].text_input("Reply", key=f"r_{tid}")
+                    if cols[1].button("Send", key=f"s_{tid}") and reply.strip():
+                        to = latest[2] if latest[2]!=current_user else latest[3]
+                        try:
+                            send_message(current_user, to, subject=latest[4], body=reply, msg_type="message", thread_id=tid, hub=hub)
+                            st.success("Reply sent."); st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+                    if is_admin_user:
+                        paid = cols[2].number_input("Paid count", min_value=0, step=1, key=f"pc_{tid}")
+                        if cols[2].button("Send paid notice", key=f"p_{tid}"):
+                            to = latest[2] if latest[2]!=current_user else latest[3]
+                            try:
+                                send_message(current_user, to, subject=f"[PAID] {latest[4]}", body=f"Paid for {int(paid)} orders.",
+                                             msg_type="paid_notice", thread_id=tid, hub=hub, paid_count=int(paid))
+                                st.success("Paid notice sent."); st.rerun()
+                            except ValueError as e:
+                                st.error(str(e))
+
+    # --- sent (admins only) ---
+    if is_admin_user:
+        with tabs[1]:
+            sent = get_sent(current_user)
+            if not sent:
+                st.info("No sent messages.")
+            else:
+                df = pd.DataFrame(sent, columns=["id","timestamp","sender","recipient","subject","body","thread_id","msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count"])
+                st.dataframe(df, use_container_width=True, height=400)
+
+    # --- compose / message HQ ---
+    compose_tab = tabs[2] if is_admin_user else tabs[1]
+    with compose_tab:
+        users = query("SELECT username, role, hub FROM users WHERE disabled=0 ORDER BY username")
+        if is_admin_user:
+            mode = st.radio("Send to…", ["User","Role","Hub"], horizontal=True)
+            if mode=="User":
+                recips = [st.selectbox("Recipient", [u[0] for u in users])]
+            elif mode=="Role":
+                role_sel = st.selectbox("Role", sorted({u[1] for u in users}))
+                recips = [u[0] for u in users if u[1]==role_sel]
+            else:
+                hub_sel = st.selectbox("Hub", sorted({u[2] for u in users if u[2]}))
+                recips = [u[0] for u in users if u[2]==hub_sel]
+        else:
+            admins = [u[0] for u in users if (u[1] or "").lower()=="admin"]
+            if not admins:
+                st.warning("No HQ users found. Ask an admin to create an Admin user.")
+                recips = []
+            else:
+                st.caption("This message will be sent to **HQ (all Admins)**.")
+                recips = admins
+
+        subject = st.text_input("Subject")
+        body = st.text_area("Message")
+        if st.button("Send message"):
+            if not recips:
+                st.warning("No recipients.")
+            else:
+                ok = 0; err = 0
+                for r in recips:
+                    try:
+                        send_message(current_user, r, subject, body, hub=hub)
+                        ok += 1
+                    except ValueError:
+                        err += 1
+                if ok:
+                    st.success(f"Sent to {ok} user(s).")
+                if err:
+                    st.error(f"{err} message(s) blocked by policy.")
+
+    # --- reports ---
+    with tabs[-1]:
+        if is_admin_user:
+            st.info("Admins can use the Compose/Reports tools or reply within threads.")
+        else:
+            # Hub reports
+            import datetime as dt
+            st.subheader("📮 Post Office Drop-off")
+            rs = st.date_input("Date", value=dt.date.today(), key="dropoff_date")
+            drop = st.number_input("Orders dropped off", min_value=0, step=1, key="dropoff_cnt")
+            note = st.text_input("Note (optional)", key="dropoff_note")
+            if st.button("Send drop-off report"):
+                if not hub:
+                    st.warning("Your user has no hub assigned.")
+                else:
+                    admins = [u[0] for u in query("SELECT username, role FROM users WHERE LOWER(role)='admin'")]
+                    subj = f"[DROPOFF] {hub} {rs.isoformat()} — {int(drop)} orders"
+                    body = note or f"{hub}: dropped off {int(drop)} orders on {rs.isoformat()}"
+                    for adm in admins:
+                        try:
+                            send_message(current_user, adm, subject=subj, body=body,
+                                         msg_type="dropoff_report", hub=hub, shipped_count=int(drop),
+                                         range_start=rs.isoformat(), range_end=rs.isoformat())
+                        except ValueError:
+                            pass
+                    st.success(f"Reported {int(drop)} orders dropped off.")
+            st.divider()
+            st.subheader("📦 Orders Shipped (range)")
+            rs2 = st.date_input("Start date", key="ship_rs")
+            re2 = st.date_input("End date", key="ship_re")
+            auto = shipments_count_for(hub or "", rs2.isoformat(), re2.isoformat()) if hub else 0
+            sc = st.number_input("Orders shipped", min_value=0, step=1, value=int(auto) if auto else 0)
+            note2 = st.text_input("Note", value=f"Hub {hub}: shipped {sc} from {rs2.isoformat()} to {re2.isoformat()}" if hub else "")
+            if st.button("Send shipped report"):
+                if not hub:
+                    st.warning("No hub assigned.")
+                else:
+                    admins = [u[0] for u in query("SELECT username, role FROM users WHERE LOWER(role)='admin'")]
+                    subj = f"[SHIPPED] {hub} {rs2.isoformat()}→{re2.isoformat()}"
+                    for adm in admins:
+                        try:
+                            send_message(current_user, adm, subject=subj, body=note2,
+                                         msg_type="shipped_report", hub=hub, shipped_count=int(sc),
+                                         range_start=rs2.isoformat(), range_end=re2.isoformat())
+                        except ValueError:
+                            pass
+                    st.success("Shipped report sent.")
+
+# ===== section 5: main UI, schemas, admin/hub/supplier pages ==================
+def ensure_logs_schema():
+    con = connect(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT,
         user TEXT,
         sku TEXT,
         hub TEXT,
         action TEXT,
         qty INTEGER,
-        comment TEXT)""", fetch=False, commit=True)
-    query("""CREATE TABLE IF NOT EXISTS sku_info (
-        sku TEXT PRIMARY KEY,
-        product_name TEXT,
-        assigned_hubs TEXT)""", fetch=False, commit=True)
-    query("""CREATE TABLE IF NOT EXISTS shipments (
+        comment TEXT
+    )""")
+    con.commit(); con.close()
+
+def ensure_shipments_schema():
+    con = connect(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS shipments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         supplier TEXT,
         tracking TEXT,
@@ -339,711 +455,968 @@ def create_tables():
         hub TEXT,
         skus TEXT,
         date TEXT,
-        status TEXT)""", fetch=False, commit=True)
-    query("""CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender TEXT,
-        receiver TEXT,
-        message TEXT,
-        thread TEXT,
-        timestamp TEXT)""", fetch=False, commit=True)
-    query("""CREATE TABLE IF NOT EXISTS count_confirmations (
-        username TEXT,
-        hub TEXT,
-        confirmed_at TEXT)""", fetch=False, commit=True)
+        status TEXT,
+        received_at TEXT,
+        received_by TEXT
+    )""")
+    # Add missing cols if legacy
+    have = [r[1] for r in cur.execute("PRAGMA table_info(shipments)").fetchall()]
+    for col, typ in {
+        "supplier":"TEXT","tracking":"TEXT","carrier":"TEXT","hub":"TEXT","skus":"TEXT",
+        "date":"TEXT","status":"TEXT","received_at":"TEXT","received_by":"TEXT"
+    }.items():
+        if col not in have:
+            cur.execute(f"ALTER TABLE shipments ADD COLUMN {col} {typ}")
+    con.commit(); con.close()
 
-def setup_db():
-    create_tables()
-    existing = query("SELECT sku FROM sku_info LIMIT 1")
-    if not existing: seed_all_skus()
-    seed_users()
+def create_indices():
+    con = connect(); cur = con.cursor()
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_hub_qty ON inventory(hub, quantity)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_hub_date ON shipments(hub, date)")
+    con.commit(); con.close()
 
-if not DB.exists():
-    setup_db()
-else:
-    create_tables()
-    seed_users()
+ensure_logs_schema()
+ensure_shipments_schema()
+create_indices()
 
-def login(username, password):
-    # fetch stored hash
-    row = query("SELECT username, password, role, hub FROM users WHERE username=?", (username,))
-    if not row:
-        return None
-    uname, stored_hash, role, hub = row[0]
-    if verify_password(password, stored_hash):
-        # Upgrade legacy sha256 to bcrypt transparently
-        if bcrypt and (not stored_hash.startswith("$2b$")):
+# --- Home helpers (admin/hub) -------------------------------------------------
+ADMIN_LOW_STOCK = 5
+LOW_STOCK_THRESHOLD = 5
+
+def users_table():
+    rows = query("SELECT username, role, hub, disabled FROM users ORDER BY username")
+    df = pd.DataFrame(rows, columns=["username","role","hub","disabled"])
+    st.subheader("👥 Users")
+    st.dataframe(df, use_container_width=True, height=300)
+
+def logs_table_filtered():
+    st.subheader("🧾 Logs")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: d1 = st.date_input("From", value=date.today()-timedelta(days=7))
+    with c2: d2 = st.date_input("To", value=date.today())
+    with c3: u = st.text_input("User")
+    with c4: h = st.text_input("Hub")
+    with c5: a = st.text_input("Action")
+    sql = "SELECT timestamp,user,action,comment,hub,sku,qty FROM logs WHERE date(timestamp) BETWEEN date(?) AND date(?)"
+    params: List = [d1.isoformat(), d2.isoformat()]
+    if u: sql += " AND user=?"; params.append(u)
+    if h: sql += " AND hub=?"; params.append(h)
+    if a: sql += " AND action=?"; params.append(a)
+    sql += " ORDER BY timestamp DESC LIMIT 5000"
+    rows = query(sql, tuple(params))
+    df = pd.DataFrame(rows, columns=["timestamp","user","action","comment","hub","sku","qty"])
+    st.dataframe(df, use_container_width=True, height=380)
+    st.download_button("Export logs.csv", df.to_csv(index=False).encode("utf-8"),
+                       "logs.csv", "text/csv")
+
+def restore_csv_tool():
+    st.subheader("🛟 Restore from CSV (safe)")
+    st.caption("Preview → Schema check → Requires confirmation → Makes a DB backup first.")
+    tbl = st.selectbox("Target table", ["users","inventory","sku_info","shipments","logs","messages"])
+    file = st.file_uploader("Choose CSV", type=["csv"], accept_multiple_files=False, key=f"up_{tbl}")
+    if not file:
+        return
+    try:
+        df = pd.read_csv(file)
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+        return
+
+    st.write("Preview (first 10 rows):")
+    st.dataframe(df.head(10), use_container_width=True)
+
+    # Schema check
+    try:
+        conn_v = connect()
+        cur_v = conn_v.cursor()
+        pragma = cur_v.execute(f"PRAGMA table_info({tbl})").fetchall()
+        table_cols = [r[1] for r in pragma]
+        conn_v.close()
+    except Exception as e:
+        st.error(f"Could not read schema for '{tbl}': {e}")
+        table_cols = list(df.columns)
+
+    missing = [c for c in table_cols if c not in df.columns]
+    extra   = [c for c in df.columns if c not in table_cols]
+    if missing:
+        st.warning(f"CSV missing expected columns for '{tbl}': {missing}")
+    if extra:
+        st.info(f"CSV has extra columns not in '{tbl}': {extra}")
+
+    confirm = st.checkbox("I understand this will overwrite existing rows for matching primary keys.")
+    if st.button("Apply Restore"):
+        if not confirm:
+            st.warning("Please confirm overwrite to proceed.")
+            return
+        # backup
+        bkp = backup_db()
+        if bkp:
+            st.caption(f"Database backed up to: `{bkp}`")
+        # transactional write
+        try:
+            conn = connect(); cur = conn.cursor()
+            conn.execute("BEGIN")
+            cols = [c for c in df.columns if c in table_cols] if table_cols else list(df.columns)
+            placeholders = ",".join(["?"]*len(cols))
+            colnames = ",".join(cols)
+            for _, row in df.iterrows():
+                values = tuple(row[c] for c in cols)
+                cur.execute(f"INSERT OR REPLACE INTO {tbl} ({colnames}) VALUES ({placeholders})", values)
+            conn.commit(); conn.close()
+            st.success(f"Restored {len(df)} rows into '{tbl}'.")
+        except Exception as e:
             try:
-                new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-                query("UPDATE users SET password=? WHERE username=?", (new_hash, username), fetch=False, commit=True)
+                conn.rollback()
             except Exception:
                 pass
-        return (uname, role, hub)
-    return None
+            st.error(f"Restore failed and was rolled back: {e}")
 
-def count_unread(username):
-    threads = query("SELECT DISTINCT thread FROM messages WHERE receiver=?", (username,))
-    unread = 0
-    for t in threads:
-        last_msg = query(
-            "SELECT sender FROM messages WHERE thread=? ORDER BY timestamp DESC LIMIT 1",
-            (t[0],)
-        )
-        if last_msg and last_msg[0][0] != username:
-            unread += 1
-    return unread
+def list_backups(limit: int = 50) -> List[Path]:
+    p = Path(DB).with_name(f"{Path(DB).stem}-*{Path(DB).suffix}")
+    return sorted(Path(DB).parent.glob(p.name), reverse=True)[:limit]
 
-# --- Login Screen ---
-if "user" not in st.session_state:
-    st.sidebar.title("🔐 Login")
-    u = st.sidebar.text_input("Username", key="login_user")
-    p = st.sidebar.text_input("Password", type="password", key="login_pw")
-    if st.sidebar.button("Login", key="login_btn"):
-        user = login(u, p)
-        if user:
-            st.session_state.user = user
-            st.rerun()
+# --- Admin Overview -----------------------------------------------------------
+def _admin_kpis() -> Dict[str, int]:
+    tqty = query("SELECT COALESCE(SUM(quantity),0) FROM inventory")
+    total_qty = int(tqty[0][0]) if tqty else 0
+    tsku = query("SELECT COUNT(DISTINCT sku) FROM inventory")
+    total_skus = int(tsku[0][0]) if tsku else 0
+    hubs = query("SELECT COUNT(DISTINCT hub) FROM inventory WHERE hub IS NOT NULL")
+    hubs_count = int(hubs[0][0]) if hubs else 0
+    low = query("SELECT COUNT(*) FROM (SELECT sku, hub FROM inventory WHERE quantity<=?)", (ADMIN_LOW_STOCK,))
+    low_count = int(low[0][0]) if low else 0
+    return dict(total_skus=total_skus, total_qty=total_qty, hubs=hubs_count, low=low_count)
+
+def _hubs_overview_df() -> pd.DataFrame:
+    rows = query("""
+        SELECT i.hub,
+               COUNT(DISTINCT i.sku) AS skus,
+               COALESCE(SUM(i.quantity),0) AS on_hand,
+               SUM(CASE WHEN i.quantity<=? THEN 1 ELSE 0 END) AS low_skus
+        FROM inventory i
+        WHERE i.hub IS NOT NULL
+        GROUP BY i.hub
+        ORDER BY i.hub
+    """, (ADMIN_LOW_STOCK,))
+    return pd.DataFrame(rows, columns=["Hub","SKUs","On hand","Low (≤{})".format(ADMIN_LOW_STOCK)])
+
+def _low_stock_all_df() -> pd.DataFrame:
+    rows = query("""
+        SELECT hub, sku, quantity
+        FROM inventory
+        WHERE quantity<=?
+        ORDER BY quantity ASC, hub, sku
+    """, (ADMIN_LOW_STOCK,))
+    return pd.DataFrame(rows, columns=["Hub","SKU","Qty"])
+
+def _shipments_overview_df(days: int = 30) -> pd.DataFrame:
+    rows = query("""
+        SELECT hub, date, supplier, tracking, carrier, status
+        FROM shipments
+        WHERE date(date) >= date('now', ?)
+        ORDER BY date(date) DESC, hub
+    """, (f"-{days} days",))
+    return pd.DataFrame(rows, columns=["Hub","Date","Supplier","Tracking","Carrier","Status"])
+
+def admin_home_page():
+    st.subheader("Admin Overview")
+    k = _admin_kpis()
+    kcols = st.columns(4)
+    kcols[0].metric("Total SKUs", k["total_skus"])
+    kcols[1].metric("On-hand pieces", k["total_qty"])
+    kcols[2].metric("Hubs", k["hubs"])
+    kcols[3].metric(f"Low-stock SKUs (≤{ADMIN_LOW_STOCK})", k["low"])
+
+    st.divider()
+    t1, t2 = st.tabs(["🏬 Hubs overview", "⚠️ Low stock (all hubs)"])
+    with t1:
+        dfh = _hubs_overview_df()
+        if dfh.empty:
+            st.info("No hub data yet.")
         else:
-            st.sidebar.error("Invalid credentials")
-    st.stop()
-
-username, role, hub = st.session_state.user
-unread = count_unread(username)
-st.sidebar.success(f"Welcome, {username} ({role})")
-st.sidebar.markdown(f"📨 **Unread Threads: {unread}**")
-if st.sidebar.button("🚪 Logout", key=f"logout_btn_{username}"):
-    del st.session_state.user
-    st.rerun()
-
-# --- Define ALL menus and logic exactly as in your latest working code, using unique keys for every Streamlit element. ---
-
-menus = {
-    "Admin": [
-        "Inventory", "Logs", "Shipments", "Messages", "Count", "Assign SKUs",
-        "Create SKU", "Upload SKUs", "User Access", "Create User",
-        "Backup", "Restore", "Google Sheets"
-    ],
-    "Hub Manager": [
-        "Inventory", "Update Stock", "Bulk Update", "Messages", "Count", "Incoming Shipments", "Google Sheets"
-    ],
-    "Retail": [
-        "Inventory", "Update Stock", "Bulk Update", "Messages", "Count", "Google Sheets"
-    ],
-    "Supplier": [
-        "Shipments"
-    ]
-}
-
-menu = st.sidebar.radio("Menu", menus[role], key="menu_radio")
-
-
-# --- User Access ---
-if menu == "User Access" and role == "Admin":
-    st.header(T("manage_users"))
-    users = query("SELECT username, role, hub FROM users")
-    df_users = pd.DataFrame(users, columns=[T("username"), T("role"), T("hub")])
-    st.dataframe(df_users, use_container_width=True, key="user_access_df")
-
-    st.subheader(T("remove_user"))
-    user_list = [u[0] for u in query("SELECT username FROM users WHERE username != ?", (username,))]
-    selected_user = st.selectbox(T("select_user"), user_list, key="remove_user_select")
-    if st.button(T("remove_user"), key="btn_remove_user"):
-        st.session_state['confirm_remove_user'] = selected_user
-
-    if st.session_state.get('confirm_remove_user') == selected_user:
-        if st.button(f"{T('confirm_remove_user')} {selected_user}?", key="btn_confirm_remove"):
-            query("DELETE FROM users WHERE username=?", (selected_user,), fetch=False, commit=True)
-            st.success(f"✅ {T('user_removed')}")
-            st.session_state.pop('confirm_remove_user')
-            st.rerun()
-
-# --- Create SKU ---
-if menu == "Create SKU" and role == "Admin":
-    st.header(T("create_new_sku"))
-    new_sku = st.text_input(T("new_sku_name"), key="create_sku_name")
-    hubs = st.multiselect(T("assign_to_hubs"), ["Hub 1", "Hub 2", "Hub 3", "Retail"], key="create_sku_hubs")
-    if st.button(T("create_sku"), key="btn_create_sku"):
-        if not new_sku.strip():
-            st.warning(T("enter_sku_name"))
-        elif not hubs:
-            st.warning("❗ Please assign at least one hub.")
+            st.dataframe(dfh, use_container_width=True, hide_index=True)
+    with t2:
+        dfl = _low_stock_all_df()
+        if dfl.empty:
+            st.success("No low-stock items across hubs.")
         else:
-            exists = query("SELECT sku FROM sku_info WHERE sku=?", (new_sku.strip(),))
-            if exists:
-                st.warning(T("sku_exists"))
-            else:
-                hubs_str = ",".join(hubs)
-                query(
-                    "INSERT INTO sku_info (sku, product_name, assigned_hubs) VALUES (?, ?, ?)",
-                    (new_sku.strip(), new_sku.strip(), hubs_str),
-                    fetch=False,
-                    commit=True
-                )
-                for h in hubs:
-                    query(
-                        "INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)",
-                        (new_sku.strip(), h, 0),
-                        fetch=False,
-                        commit=True
-                    )
-                st.success(f"✅ SKU '{new_sku}' created and assigned!")
-                st.rerun()
+            st.dataframe(dfl, use_container_width=True, height=320)
+            st.download_button("Export low_stock_all.csv", dfl.to_csv(index=False).encode("utf-8"),
+                               "low_stock_all.csv", "text/csv")
 
-# --- Upload SKUs ---
-if menu == "Upload SKUs" and role == "Admin":
-    st.header(T("upload_skus"))
-    uploaded_file = st.file_uploader(T("upload_csv"), type="csv", key="upload_sku_file")
-    if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-            if df.empty:
-                st.warning("CSV is empty.")
-            else:
-                inserted_count = 0
-                for _, row in df.iterrows():
-                    sku = str(row['sku']).strip()
-                    product_name = str(row.get('product_name', sku)).strip()
-                    assigned_hubs = str(row.get('assigned_hubs', 'Retail')).strip()
-                    if sku:
-                        query(
-                            "INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?, ?, ?)",
-                            (sku, product_name, assigned_hubs),
-                            fetch=False,
-                            commit=True
-                        )
-                        for h in assigned_hubs.split(","):
-                            query(
-                                "INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)",
-                                (sku, h.strip(), 0),
-                                fetch=False,
-                                commit=True
-                            )
-                        inserted_count += 1
-                st.success(f"Uploaded {inserted_count} SKUs!")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Upload error: {e}")
-
-# --- Assign SKUs ---
-if menu == "Assign SKUs" and role == "Admin":
-    st.header(T("assign_skus"))
-    skus = [s[0] for s in query("SELECT sku FROM sku_info")]
-    sku_choice = st.selectbox(T("select_sku_assign"), skus, key="assign_sku_select")
-    hubs = ["Hub 1", "Hub 2", "Hub 3", "Retail"]
-    assigned = query("SELECT assigned_hubs FROM sku_info WHERE sku=?", (sku_choice,))
-    current = assigned[0][0].split(",") if assigned and assigned[0][0] else []
-    new_hubs = st.multiselect(T("assign_to_hubs"), hubs, default=current, key="assign_hubs_multiselect")
-    if st.button(T("update_assignments"), key="btn_update_assignments"):
-        combined = ",".join(new_hubs)
-        query("UPDATE sku_info SET assigned_hubs=? WHERE sku=?", (combined, sku_choice), fetch=False, commit=True)
-        for h in new_hubs:
-            query(
-                "INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)",
-                (sku_choice, h, 0),
-                fetch=False,
-                commit=True
-            )
-        st.success(T("assignment_updated"))
-        st.rerun()
-
-# --- Create User ---
-if menu == "Create User" and role == "Admin":
-    st.header(T("create_user"))
-    new_username = st.text_input(T("username"), key="create_user_name")
-    new_password = st.text_input(T("password"), type="password", key="create_user_pw")
-    new_role = st.selectbox(T("role"), ["Admin", "Hub Manager", "Retail", "Supplier"], key="create_user_role")
-    if new_role == "Hub Manager":
-        new_hub = st.selectbox(T("hub"), ["Hub 1", "Hub 2", "Hub 3"], key="create_user_hub")
-    elif new_role == "Retail":
-        new_hub = "Retail"
+    st.divider()
+    st.subheader("📦 Shipments (last 30 days)")
+    dfs = _shipments_overview_df(30)
+    if dfs.empty:
+        st.info("No shipments in the last 30 days.")
     else:
-        new_hub = ""
-    if st.button(T("create_user"), key="btn_create_user"):
-        if not new_username.strip() or not new_password.strip():
-            st.warning("Please enter both username and password.")
-        else:
-            hashed_pw = hashlib.sha256(new_password.encode()).hexdigest()
-            exists = query("SELECT username FROM users WHERE username=?", (new_username.strip(),))
-            if exists:
-                st.warning("User already exists!")
-            else:
-                query(
-                    "INSERT INTO users (username, password, role, hub) VALUES (?, ?, ?, ?)",
-                    (new_username.strip(), hashed_pw, new_role, new_hub),
-                    fetch=False,
-                    commit=True
-                )
-                st.success(f"✅ User '{new_username.strip()}' created successfully!")
-                st.rerun()
+        st.dataframe(dfs, use_container_width=True, height=300)
 
-# --- Backup ---
-if menu == "Backup" and role == "Admin":
-    st.header(T("backup"))
-    st.write("Download CSV backups for all main tables.")
-    tables = ["users", "inventory", "logs", "sku_info", "shipments", "messages", "count_confirmations"]
-    for table in tables:
-        rows = query(f"SELECT * FROM {table}")
-        if not rows:
-            st.info(f"No data in table '{table}' to backup.")
-            continue
-        cols_info = query(f"PRAGMA table_info({table})", fetch=True)
-        columns = [col[1] for col in cols_info]
-        df = pd.DataFrame(rows, columns=columns)
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
-        csv_data = csv_buffer.getvalue()
-        st.download_button(f"{T('download_backup')} '{table}'", csv_data, file_name=f"{table}_backup.csv", mime="text/csv", key=f"download_{table}")
+    st.divider()
+    st.subheader("👥 Users")
+    users_table()
 
-# --- Restore ---
-if menu == "Restore" and role == "Admin":
-    st.header(T("restore"))
-    st.write("Upload CSV files to restore data to tables. Upload one table at a time.")
-    tables = ["users", "inventory", "logs", "sku_info", "shipments", "messages", "count_confirmations"]
-    for tbl in tables:
-        with st.expander(f"Restore '{tbl}'"):
-            uploaded_file = st.file_uploader(f"Upload CSV for '{tbl}'", type="csv", key=f"restore_upload_{tbl}")
-            if uploaded_file is not None:
+def admin_logs_page(role: str):
+    if not is_admin(role):
+        st.error("Unauthorized."); return
+    st.header("🧾 Logs")
+    logs_table_filtered()
+
+def admin_page(role: str):
+    if not is_admin(role):
+        st.error("Unauthorized."); return
+    st.header("🛠️ Admin")
+    tabs = st.tabs(["💽 Backups", "📥 CSV Restore"])
+
+    # --- Backups tab ---
+    with tabs[0]:
+        st.subheader("Back up & Restore SQLite DB")
+        col = st.columns(3)
+        with col[0]:
+            try:
+                with open(DB, "rb") as f:
+                    st.download_button("Download live DB", f.read(), file_name=Path(DB).name, mime="application/octet-stream")
+            except Exception as e:
+                st.error(f"Could not read DB: {e}")
+        with col[1]:
+            if st.button("Create backup now"):
+                b = backup_db()
+                if b:
+                    st.success(f"Backup created: {b.name}")
+                else:
+                    st.error("Backup failed.")
+        with col[2]:
+            up = st.file_uploader("Restore from backup (.db)", type=["db"], accept_multiple_files=False, key="db_restore")
+            if up is not None:
+                tmp_path = Path(DB).with_suffix(".upload.tmp")
                 try:
-                    df = pd.read_csv(uploaded_file)
-                    if df.empty:
-                        st.warning("Uploaded CSV is empty.")
-                        continue
-                    df.columns = df.columns.str.strip().str.lower()
-                    df.rename(columns={"qty": "quantity"}, inplace=True)
-                    allowed_columns = [col[1] for col in query(f"PRAGMA table_info({tbl})")]
-                    df = df[[col for col in df.columns if col in allowed_columns]]
-                    cols = ", ".join(df.columns)
-                    placeholders = ", ".join(["?"] * len(df.columns))
-                    inserted_count = 0
-                    for _, row in df.iterrows():
-                        values = tuple(row[col] for col in df.columns)
-                        query(
-                            f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
-                            values,
-                            fetch=False,
-                            commit=True
-                        )
-                        inserted_count += 1
-                    st.success(f"Restored {inserted_count} records into '{tbl}'!")
+                    tmp_path.write_bytes(up.getbuffer())
+                    b = backup_db()
+                    import shutil
+                    shutil.copy2(tmp_path, DB)
+                    st.success(f"Restored from upload. Previous DB backed up to: {b.name if b else 'unknown (backup failed)'}")
+                    st.caption("Please refresh the page.")
                 except Exception as e:
-                    st.error(f"Error restoring table '{tbl}': {e}")
+                    st.error(f"Restore failed: {e}")
+                finally:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
-# (Other menus—Inventory, Update Stock, Bulk Update, Logs, Messages, etc.—remain as in the original script above, and use unique keys on every Streamlit element.)
-
-# --- Inventory ---
-if menu == "Inventory":
-    st.header(T("export_inventory"))
-    if role == "Admin":
-        rows = query("SELECT sku, hub, quantity FROM inventory ORDER BY hub")
-    else:
-        rows = query("SELECT sku, hub, quantity FROM inventory WHERE hub=?", (hub,))
-    df = pd.DataFrame(rows, columns=[T("sku"), T("hub"), T("qty")])
-    df['Status'] = df[T("qty")].apply(lambda x: "🟥 Low" if x < 10 else "✅ OK")
-    sku_filter = st.text_input(T("select_sku"), key="filter_by_sku")
-    if sku_filter:
-        df = df[df[T("sku")].str.contains(sku_filter, case=False)]
-    st.dataframe(df, use_container_width=True, key="inventory_df")
-    buff = io.StringIO()
-    df.to_csv(buff, index=False)
-    st.download_button(T("export_inventory"), buff.getvalue(), "inventory.csv", "text/csv", key="export_inventory_btn")
-
-# --- Update Stock ---
-if menu == "Update Stock":
-    st.header(T("update_inventory"))
-    options = query("SELECT sku FROM sku_info WHERE assigned_hubs LIKE ?", (f"%{hub}%",))
-    sku_list = [o[0] for o in options]
-    sku = st.selectbox(T("select_sku"), sku_list, key="update_sku_select")
-    action = st.radio(T("action"), ["IN", "OUT"], key="update_action_radio")
-    qty = st.number_input(T("quantity"), min_value=1, step=1, key="update_qty")
-    comment = st.text_input(T("optional_comment"), key="update_comment")
-    if st.button(T("submit_update"), key="btn_update_stock"):
-        record = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku, hub))
-        current = record[0][0] if record else 0
-        if action == "OUT" and qty > current:
-            st.warning("❌ Not enough stock to remove that amount!")
+        st.markdown("### Recent backups")
+        bks = list_backups()
+        if not bks:
+            st.info("No backups found yet.")
         else:
-            new_qty = current + qty if action == "IN" else current - qty
-            query(
-                """INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
-                   ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity""",
-                (sku, hub, new_qty),
-                fetch=False,
-                commit=True
-            )
-            query(
-                "INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (datetime.now().isoformat(), username, sku, hub, action, qty, comment),
-                fetch=False,
-                commit=True
-            )
-            st.success(
-                f"✅ Inventory updated!  \n**SKU:** {sku}  \n**Hub:** {hub}  \n**Action:** {action}  \n**Qty:** {qty}  \n**New Qty:** {new_qty}"
-            )
+            for b in bks:
+                cols = st.columns([4,1])
+                with cols[0]:
+                    st.caption(b.name)
+                with cols[1]:
+                    try:
+                        with open(b, "rb") as f:
+                            st.download_button("Download", f.read(), file_name=b.name, mime="application/octet-stream", key=f"d_{b.name}")
+                    except Exception as e:
+                        st.error(f"Could not read backup {b.name}: {e}")
+
+    # --- CSV Restore tab ---
+    with tabs[1]:
+        restore_csv_tool()
+
+# --- Hub Home (dashboard) -----------------------------------------------------
+def _hub_kpis(hub: str) -> Dict[str, int]:
+    tq = query("SELECT COALESCE(SUM(quantity),0) FROM inventory WHERE hub=?", (hub,))
+    total_qty = int(tq[0][0]) if tq else 0
+    sk = query("SELECT COUNT(*) FROM (SELECT sku FROM inventory WHERE hub=? AND quantity>0)", (hub,))
+    skus_stocked = int(sk[0][0]) if sk else 0
+    ls = query("SELECT COUNT(*) FROM inventory WHERE hub=? AND quantity<=?", (hub, LOW_STOCK_THRESHOLD))
+    low_count = int(ls[0][0]) if ls else 0
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+    sw = query("SELECT COUNT(*) FROM shipments WHERE hub=? AND date(date) BETWEEN date(?) AND date(?)",
+               (hub, week_start.isoformat(), week_end.isoformat()))
+    ship_week = int(sw[0][0]) if sw else 0
+    return dict(skus=skus_stocked, qty=total_qty, low=low_count, ship_week=ship_week)
+
+def _low_stock_df(hub: str) -> pd.DataFrame:
+    rows = query("""
+        SELECT i.sku, i.quantity
+        FROM inventory i
+        WHERE i.hub=? AND i.quantity<=?
+        ORDER BY i.quantity ASC, i.sku
+        """, (hub, LOW_STOCK_THRESHOLD))
+    return pd.DataFrame(rows, columns=["SKU","Qty"])
+
+def _recent_shipments_df(hub: str, days: int = 30) -> pd.DataFrame:
+    rows = query("""
+        SELECT id, date, supplier, tracking, carrier, status
+        FROM shipments
+        WHERE hub=? AND date(date) >= date('now', ?)
+        ORDER BY date(date) DESC
+        """, (hub, f"-{days} days"))
+    return pd.DataFrame(rows, columns=["ID","Date","Supplier","Tracking","Carrier","Status"])
+
+def hub_home_page(username: str, hub: Optional[str]):
+    if not hub:
+        st.info("No hub assigned to your user yet.")
+        return
+    st.subheader(f"{hub} — Dashboard")
+    k = _hub_kpis(hub)
+    kcols = st.columns(4)
+    kcols[0].metric("SKUs stocked", k["skus"])
+    kcols[1].metric("On-hand pieces", k["qty"])
+    kcols[2].metric(f"Low stock (≤{LOW_STOCK_THRESHOLD})", k["low"])
+    kcols[3].metric("Shipments this week", k["ship_week"])
+
+    st.divider()
+    st.subheader("⚠️ Low stock")
+    ldf = _low_stock_df(hub)
+    if ldf.empty:
+        st.success("No low-stock SKUs.")
+    else:
+        st.dataframe(ldf, use_container_width=True, height=260)
+        st.download_button("Export low_stock.csv", ldf.to_csv(index=False).encode("utf-8"), "low_stock.csv", "text/csv")
+
+    st.divider()
+    st.subheader("📦 Incoming Shipments")
+    sdf = _recent_shipments_df(hub, days=90)
+    if sdf.empty:
+        st.info("No recent shipments.")
+    else:
+        st.dataframe(sdf, use_container_width=True, height=260)
+        # Action controls per open shipment
+        open_rows = query("SELECT id, tracking, carrier, skus, status FROM shipments WHERE hub=? AND status IN ('Created','In Transit') ORDER BY id DESC", (hub,))
+        if open_rows:
+            st.caption("Open shipments (confirm to auto-IN inventory):")
+            for sid, trk, car, skus_str, status in open_rows[:50]:
+                cols = st.columns([3,2,2,2,2])
+                cols[0].markdown(f"**#{sid}** · {status}")
+                cols[1].markdown(f"Carrier: {car or '—'}")
+                cols[2].markdown(f"Tracking: {trk or '—'}")
+                if cols[3].button("Mark In Transit", key=f"mit_{sid}"):
+                    query("UPDATE shipments SET status=?, date=? WHERE id=?", ("In Transit", _now_iso(), sid), fetch=False, commit=True)
+                    st.success(f"Shipment #{sid} marked In Transit."); st.rerun()
+                if cols[4].button("Confirm Received", key=f"rcv_{sid}"):
+                    ok, msg = _confirm_receive_shipment(sid, hub, username)
+                    if ok:
+                        st.success(msg); st.rerun()
+                    else:
+                        st.error(msg)
+
+# --- Supplier Home ------------------------------------------------------------
+CARRIERS = ["UPS", "USPS", "FedEx", "DHL", "Other…"]
+
+def _parse_items(s: str) -> Tuple[bool, List[Tuple[str,int]], str]:
+    """
+    Parse items in format: SKU|QTY;SKU|QTY (no spaces needed; we trim).
+    Returns (ok, items, error_msg)
+    """
+    if not s or not s.strip():
+        return False, [], "Items are required. Format: SKU|QTY;SKU|QTY"
+    items: List[Tuple[str,int]] = []
+    parts = [p for p in s.replace("\n",";").split(";") if p.strip()]
+    for p in parts:
+        if "|" not in p:
+            return False, [], f"Bad item '{p}'. Use SKU|QTY."
+        sku, qty = p.split("|", 1)
+        sku = sku.strip()
+        try:
+            q = int(str(qty).strip())
+        except:
+            return False, [], f"Quantity must be an integer for '{sku}'."
+        if q <= 0:
+            return False, [], f"Quantity must be > 0 for '{sku}'."
+        items.append((sku, q))
+    return True, items, ""
+
+def _all_catalog_skus() -> List[str]:
+    """All known SKUs from the catalog."""
+    rows = query("SELECT sku FROM sku_info ORDER BY sku")
+    return [r[0] for r in rows]
+
+def _ensure_sku_in_catalog(sku: str, hub: Optional[str]):
+    """Make sure a SKU exists in sku_info and is assigned to hub (for convenience)."""
+    sku = (sku or "").strip()
+    if not sku:
+        return
+    # Insert if missing
+    query("INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
+          (sku, sku, hub or ""), fetch=False, commit=True)
+    # Append hub to assigned_hubs if not present
+    rows = query("SELECT assigned_hubs FROM sku_info WHERE sku=?", (sku,))
+    if rows:
+        hubs = (rows[0][0] or "").split(",") if rows[0][0] else []
+        hubs = [h.strip() for h in hubs if h and h.strip()]
+        if hub and hub not in hubs:
+            hubs.append(hub)
+            query("UPDATE sku_info SET assigned_hubs=? WHERE sku=?", (",".join(sorted(set(hubs))), sku),
+                  fetch=False, commit=True)
+    # Ensure inventory row exists for that hub, qty 0
+    if hub:
+        query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
+              (sku, hub, 0), fetch=False, commit=True)
+
+def supplier_home_page(username: str):
+    st.subheader("Supplier — Create Shipment")
+    hubs = [h[0] for h in query("SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL ORDER BY hub")]
+    if not hubs:
+        st.info("No hubs configured yet.")
+        return
+
+    hub_sel = st.selectbox("Hub", hubs)
+
+    car_sel = st.selectbox("Carrier", CARRIERS, index=0)
+    car_text = ""
+    if car_sel == "Other…":
+        car_text = st.text_input("Carrier (other)")
+    trk = st.text_input("Tracking (optional)")
+
+    st.markdown("### Items")
+    # Filter + checklist
+    filter_text = st.text_input("Filter SKUs", "", placeholder="Type to narrow the list…")
+    catalog = _all_catalog_skus()
+    shown = [s for s in catalog if filter_text.lower() in s.lower()] if filter_text else catalog
+
+    selected: List[Tuple[str,int]] = []
+    if not shown:
+        st.info("No SKUs match that filter.")
+    else:
+        st.caption("Tick SKUs and enter quantities. Only checked items with qty > 0 will be included.")
+        for sku in shown:
+            cols = st.columns([6,2])
+            checked = cols[0].checkbox(sku, key=f"sup_cb_{sku}")
+            qty_val = cols[1].number_input("Qty", min_value=1, step=1, value=1, key=f"sup_qty_{sku}")
+            if checked:
+                selected.append((sku, int(qty_val)))
+
+    # Optional: add a new color/SKU that’s not listed yet
+    with st.expander("➕ Add new color / SKU (optional)", expanded=False):
+        new_sku = st.text_input("New color / SKU name", placeholder="e.g., Ocean Teal Solid")
+        new_qty = st.number_input("Qty (for the new SKU)", min_value=0, step=1, value=0)
+
+    # Build preview summary
+    preview_items = list(selected)
+    if (new_sku or "").strip() and new_qty > 0:
+        preview_items.append((new_sku.strip(), int(new_qty)))
+
+    if preview_items:
+        total_lines = len(preview_items)
+        total_units = sum(q for _, q in preview_items)
+        st.caption(f"Preview: {total_lines} SKU(s), {total_units} total units")
+
+    if st.button("Create shipment"):
+        if not preview_items:
+            st.warning("Please select at least one SKU with qty.")
+        else:
+            # Ensure new SKU exists in catalog and assigned to hub
+            if (new_sku or "").strip() and new_qty > 0:
+                _ensure_sku_in_catalog(new_sku.strip(), hub_sel)
+            # Ensure selected catalog SKUs assigned to hub
+            for sku, _q in selected:
+                _ensure_sku_in_catalog(sku, hub_sel)
+            # Compile items format
+            items_str = ";".join([f"{sku}|{qty}" for sku, qty in preview_items])
+            carrier_final = car_text.strip() if car_sel == "Other…" else car_sel
+            query("""INSERT INTO shipments (supplier, tracking, carrier, hub, skus, date, status)
+                     VALUES (?,?,?,?,?,?,?)""",
+                  (username, trk.strip() or None, carrier_final or None, hub_sel, items_str, _now_iso(), "Created"),
+                  fetch=False, commit=True)
+            st.success("Shipment created.")
             st.rerun()
 
-# --- Bulk Update ---
-if menu == "Bulk Update":
-    st.header(T("bulk_update"))
-    rows = query("SELECT sku, quantity FROM inventory WHERE hub=?", (hub,))
-    df = pd.DataFrame(rows, columns=[T("sku"), T("qty")])
+    st.divider()
+    st.subheader("My Shipments (last 90 days)")
+    rows = query("""SELECT id, date, hub, carrier, tracking, status, skus
+                    FROM shipments
+                    WHERE supplier=? AND date(date) >= date('now','-90 days')
+                    ORDER BY id DESC""", (username,))
+    if not rows:
+        st.info("No shipments yet.")
+    else:
+        for (sid, sdate, shub, scar, strk, sst, sskus) in rows[:200]:
+            st.markdown(f"**#{sid}** · {sdate} · Hub: {shub} · Status: {sst}")
+            c = st.columns([2,3,3,2,2])
+            with c[0]:
+                st.caption(f"Items: {sskus}")
+            with c[1]:
+                # Edit carrier (if not received)
+                if sst != "Received":
+                    curr = scar or ""
+                    choices = CARRIERS + ["(keep)"]
+                    default_idx = choices.index("(keep)") if curr not in CARRIERS else CARRIERS.index(curr)
+                    new_car_sel = st.selectbox("Carrier", choices, index=default_idx, key=f"csel_{sid}")
+                    new_car = curr
+                    if new_car_sel == "Other…":
+                        new_car = st.text_input("Carrier (other)", value=curr, key=f"coth_{sid}")
+                    elif new_car_sel == "(keep)":
+                        new_car = curr
+                    else:
+                        new_car = new_car_sel
+                    if st.button("Save carrier", key=f"csave_{sid}"):
+                        query("UPDATE shipments SET carrier=? WHERE id=?", (new_car.strip() or None, sid), fetch=False, commit=True)
+                        try:
+                            query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                                  (_now_iso(), username, None, shub, "update_carrier", None, f"shipment #{sid} → {new_car}"),
+                                  fetch=False, commit=True)
+                        except Exception:
+                            pass
+                        st.success("Carrier updated."); st.rerun()
+                else:
+                    st.caption(f"Carrier: {scar or '—'}")
+            with c[2]:
+                # Edit tracking (if not received)
+                if sst != "Received":
+                    new_trk = st.text_input("Tracking", value=strk or "", key=f"trk_{sid}")
+                    if st.button("Save tracking", key=f"tsave_{sid}"):
+                        if len(new_trk.strip()) == 0:
+                            st.error("Tracking cannot be blank once editing.")
+                        elif len(new_trk.strip()) > 100 or "\n" in new_trk:
+                            st.error("Tracking is too long or invalid.")
+                        else:
+                            query("UPDATE shipments SET tracking=? WHERE id=?", (new_trk.strip(), sid), fetch=False, commit=True)
+                            try:
+                                query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                                      (_now_iso(), username, None, shub, "update_tracking", None, f"shipment #{sid} → {new_trk.strip()}"),
+                                      fetch=False, commit=True)
+                            except Exception:
+                                pass
+                            st.success("Tracking updated."); st.rerun()
+                else:
+                    st.caption(f"Tracking: {strk or '—'}")
+            with c[3]:
+                if sst != "Received" and st.button("Mark In Transit", key=f"sup_mit_{sid}"):
+                    query("UPDATE shipments SET status=?, date=? WHERE id=?", ("In Transit", _now_iso(), sid), fetch=False, commit=True)
+                    st.success("Marked In Transit."); st.rerun()
+            with c[4]:
+                st.caption(" ")
 
-    with st.form("bulk_update_form"):
-        st.info("Enter a positive number for IN, negative for OUT. Leave blank to skip. Comments optional.", icon="ℹ️")
-        update_data = []
-        for idx, row in df.iterrows():
-            with st.expander(f"{row[T('sku')]} (Current: {row[T('qty')]})", expanded=False):
-                adj = st.text_input(
-                    T("adjust_quantity"), 
-                    value="", 
-                    key=f"adj_{idx}_{row[T('sku')]}",
-                    placeholder="+5 or -3"
-                )
-                comment = st.text_input(
-                    T("comment"), 
-                    value="", 
-                    key=f"comm_{idx}_{row[T('sku')]}",
-                    placeholder="Optional"
-                )
-                update_data.append((row[T("sku")], adj, comment))
-        submitted = st.form_submit_button(T("apply_updates"))
+# --- Shipment receive (hub) ---------------------------------------------------
+def _confirm_receive_shipment(sid: int, hub: str, username: str) -> Tuple[bool,str]:
+    row = query("SELECT status, skus, tracking, carrier FROM shipments WHERE id=? AND hub=?", (sid, hub))
+    if not row:
+        return False, "Shipment not found for your hub."
+    status, skus_str, tracking, carrier = row[0]
+    if status == "Received":
+        return False, "Shipment already received."
+    ok, items, err = _parse_items(skus_str or "")
+    if not ok:
+        return False, f"Could not parse items: {err}"
+
+    # Apply IN per item
+    for sku, qty in items:
+        sku_norm = sku.strip()
+        r = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_norm, hub))
+        current = int(r[0][0]) if r else 0
+        new_qty = current + qty
+        query("""
+            INSERT INTO inventory (sku, hub, quantity) VALUES (?,?,?)
+            ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
+        """, (sku_norm, hub, new_qty), fetch=False, commit=True)
+        # ensure sku_info row exists (KISS auto-create)
+        query("INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
+              (sku_norm, sku_norm, hub), fetch=False, commit=True)
+        # log
+        try:
+            query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                  (_now_iso(), username, sku_norm, hub, "IN", qty, f"from shipment #{sid} tracking={tracking or ''} carrier={carrier or ''}"),
+                  fetch=False, commit=True)
+        except Exception:
+            pass
+
+    # finalize shipment
+    query("UPDATE shipments SET status='Received', received_at=?, received_by=? WHERE id=?",
+          (_now_iso(), username, sid), fetch=False, commit=True)
+
+    # notify admins (optional but nice)
+    admins = [u[0] for u in query("SELECT username FROM users WHERE LOWER(role)='admin'")]
+    subj = f"[RECEIVED] Hub {hub} shipment #{sid}"
+    body = f"Hub {hub} received shipment #{sid}. Tracking={tracking or '—'}"
+    for adm in admins:
+        try:
+            send_message(username, adm, subject=subj, body=body, msg_type="message", hub=hub)
+        except ValueError:
+            pass
+
+    return True, f"Shipment #{sid} received and inventory updated."
+
+# --- SKU & Inventory Schemas + Seeding ---------------------------------------
+import io as _io
+
+def ensure_sku_inventory_schemas():
+    con = connect(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS sku_info (
+        sku TEXT PRIMARY KEY,
+        product_name TEXT,
+        assigned_hubs TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS inventory (
+        sku TEXT,
+        hub TEXT,
+        quantity INTEGER,
+        PRIMARY KEY (sku, hub)
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS count_confirmations (
+        username TEXT,
+        hub TEXT,
+        confirmed_at TEXT
+    )""")
+    con.commit(); con.close()
+
+def _seed_all_skus():
+    # Minimal seed for demo; keep your existing long list if desired
+    hub_assignments = {
+        "Hub 1": ["All American Stripes","Carolina Blue and White Stripes","Navy and Silver Stripes",
+                  "Black and Hot Pink Stripes","Bubble Gum and White Stripes","White and Ice Blue Stripes",
+                  "Imperial Purple and White Stripes","Hot Pink and White Stripes","Rainbow Stripes",
+                  "Twilight Pop","Juicy Purple","Lovely Lilac","Black","Black and White Stripes"],
+        "Hub 2": ["Black and Yellow Stripes","Orange and Black Stripes","Black and Purple Stripes",
+                  "Black and Orange Stripes","Electric Blue and White Stripes","Blossom Breeze","Candy Cane Stripes",
+                  "Plum Solid","Patriots (Custom)","Snow Angel (Custom)","Cranberry Frost (Custom)","Witchy Vibes",
+                  "White and Green Stripes","Black Solid","Black and White Stripes"],
+        "Hub 3": ["Black and Grey Stripes","Black and Green Stripes","Smoke Grey and Black Stripes",
+                  "Black and Red Stripes","Black and Purple","Dark Cherry and White Stripes","Black and Multicolor Stripes",
+                  "Puerto Rican (Custom)","Seahawks (Custom)","PCH (Custom)","Valentine Socks","Rainbow Stripes",
+                  "Thin Black Socks","Thin Black and White Stripes","Smoke Grey Solid","Cherry Solid",
+                  "Brown Solid","Wheat and White Stripes","Black Solid","Black and White Stripes"]
+    }
+    retail_skus = [
+        "Black Solid","Bubblegum","Tan Solid","Hot Pink Solid","Brown Solid","Dark Cherry Solid",
+        "Winter White Solid","Coral Orange","Navy Solid","Electric Blue Solid","Celtic Green",
+        "Cherry Solid","Smoke Grey Solid","Chartreuse Green","Lovely Lilac","Carolina Blue Solid",
+        "Juicy Purple","Green & Red Spaced Stripes","Winter Green Stripes","Midnight Frost Stripes",
+        "Witchy Vibes Stripes","Light Purple & White Spaced Stripes","Peppermint Stripes",
+        "Red & Black Spaced Stripes","Gothic Chic Stripes","Sugar Rush Stripes","Emerald Onyx Stripes",
+        "Pumpkin Spice Stripes","Pink & White Spaced Stripes","All American Stripes",
+        "Candy Cane Stripes","Blossom Breeze","White and Ice Blue Stripes","Christmas Festive Stripes",
+        "White w/ Black stripes","Navy w/ White stripes","Cyan w/ White stripes",
+        "Celtic Green and White Stripes","Twilight Pop","Black and Multicolor Stripes",
+        "Black w/ Pink stripes","Black and Yellow Stripes","BHM","Solar Glow","Navy and Silver Stripes",
+        "Cherry and White Stripes","Wheat and White Stripes","Brown w/ White stripes",
+        "White and Green Stripes","Coral w/ White stripes","Imperial Purple and White Stripes",
+        "Carolina Blue and White Stripes","Smoke Grey and White Stripes","Black w/ White stripes",
+        "Bubble Gum and White Stripes","Dark Cherry and White Stripes","Hot Pink w/ White stripes",
+        "Orange and Black Stripes","Black and Orange Stripes","Black w/Red stripes",
+        "Smoke Grey w/Black Stripes","Royal Blue solid","Black w/Grey stripes","Black w/Purple stripes",
+        "Black w/Rainbow Stripes","Black and Green Stripes","Heart Socks","Shamrock Socks",
+        "Plum Solid","Pumpkin Solid","PCH","Cranberry Frost","Snowy Angel","Pats","Seahawks",
+        "Black solid (THN)","White solid (THN)","Black w/ White stripes (THN)","Yellow (THN)",
+        "Black w/Red stripes (THN)","Black w/Pink stripes (THN)","Hot Pink w/White stripes (THN)",
+        "Black Solid (SHORT)","White Solid (SHORT)","Black and White Stripes (SHORT)"
+    ]
+    all_skus = set(retail_skus)
+    for hub_list in hub_assignments.values():
+        all_skus.update(hub_list)
+    for sku in sorted(all_skus):
+        assigned = [h for h, skus in hub_assignments.items() if sku in skus]
+        if sku in retail_skus:
+            assigned.append("Retail")
+        assigned = sorted(set(assigned))
+        query("INSERT OR REPLACE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
+              (sku, sku, ",".join(assigned)), fetch=False, commit=True)
+        for h in assigned:
+            query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
+                  (sku, h, 0), fetch=False, commit=True)
+
+def seed_sku_inventory_if_empty():
+    rows = query("SELECT COUNT(*) FROM sku_info")
+    if rows and rows[0][0] == 0:
+        _seed_all_skus()
+
+ensure_sku_inventory_schemas()
+seed_sku_inventory_if_empty()
+
+# ===== Section 7: Inventory (clean Hubs UI + list + IN/OUT + transfer + count)
+# ---------- Hubs UI helpers ----------
+def _hub_stats() -> pd.DataFrame:
+    rows = query("""
+        SELECT hub, COUNT(DISTINCT sku) AS sku_count, COALESCE(SUM(quantity), 0) AS total_qty
+        FROM inventory
+        GROUP BY hub
+        ORDER BY hub
+    """)
+    return pd.DataFrame(rows, columns=["hub", "sku_count", "total_qty"])
+
+def _hubs_list() -> List[str]:
+    rows = query("""
+        SELECT hub FROM (
+          SELECT DISTINCT hub FROM users WHERE hub IS NOT NULL
+          UNION
+          SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL
+        )
+        WHERE TRIM(hub) <> ''
+        ORDER BY hub
+    """)
+    return [r[0] for r in rows]
+
+def _hub_options_for(role: str, user_hub: Optional[str]) -> List[str]:
+    hubs = _hubs_list()
+    if (role or "").lower() == "admin":
+        return (["All hubs"] + hubs) if hubs else ["All hubs"]
+    if user_hub and user_hub in hubs:
+        return [user_hub]
+    return hubs[:1] if hubs else []
+
+def _format_hub_option(opt: str, stats: Dict[str, Tuple[int, int]]) -> str:
+    if opt == "All hubs":
+        total_skus = sum(v[0] for v in stats.values()) if stats else 0
+        total_qty  = sum(v[1] for v in stats.values()) if stats else 0
+        return f"All hubs — {total_skus} SKUs · {total_qty} pcs"
+    if opt in stats:
+        skus, qty = stats[opt]
+        return f"{opt} — {skus} SKUs · {qty} pcs"
+    return opt
+
+def render_hub_selector(username: str, role: str, user_hub: Optional[str]) -> Tuple[Optional[str], str]:
+    stats_df = _hub_stats()
+    stats = {r.hub: (int(r.sku_count), int(r.total_qty)) for _, r in stats_df.iterrows()}
+    opts = _hub_options_for(role, user_hub)
+    if not opts:
+        st.warning("No hubs yet. Add inventory or assign a hub to your user.")
+        return (None, "No hub")
+    index = 0
+    if user_hub and user_hub in opts:
+        index = opts.index(user_hub)
+    nice_opts = [_format_hub_option(o, stats) for o in opts]
+    with st.container():
+        c1, c2 = st.columns([1, 6])
+        with c1: st.caption("Hub")
+        with c2:
+            sel_nice = st.radio("Choose hub", nice_opts, index=index, horizontal=True, label_visibility="collapsed")
+    raw = opts[nice_opts.index(sel_nice)]
+    selected_hub = None if raw == "All hubs" else raw
+
+    # chip
+    if selected_hub:
+        skus, qty = stats.get(selected_hub, (0, 0))
+        chip = f"{selected_hub} · {skus} SKUs · {qty} pcs"
+    else:
+        tot_skus = sum(v[0] for v in stats.values()); tot_qty  = sum(v[1] for v in stats.values())
+        chip = f"All hubs · {tot_skus} SKUs · {tot_qty} pcs"
+    st.markdown(
+        f"""<div style="display:inline-block;padding:.35rem .6rem;border-radius:999px;background:#1f2937;color:#e5e7eb;font-size:0.85rem;margin-bottom:.5rem;">{chip}</div>""",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Hub overview", expanded=False):
+        if stats_df.empty:
+            st.info("No inventory yet.")
+        else:
+            st.dataframe(stats_df.rename(columns={"hub":"Hub","sku_count":"SKUs","total_qty":"On hand"}),
+                         use_container_width=True, hide_index=True)
+    return (selected_hub, raw)
+
+# ---------- Data helpers ----------
+def _inventory_df_for(role: str, selected_hub: Optional[str]) -> pd.DataFrame:
+    if (role or "").lower() == "admin" and selected_hub is None:
+        rows = query("SELECT sku, hub, quantity FROM inventory ORDER BY hub, sku")
+    else:
+        rows = query("SELECT sku, hub, quantity FROM inventory WHERE hub=? ORDER BY sku", (selected_hub,))
+    return pd.DataFrame(rows, columns=["SKU", "Hub", "Qty"])
+
+def _skus_for_scope(selected_hub: Optional[str], admin_all: bool) -> List[str]:
+    if admin_all:
+        rows = query("SELECT DISTINCT sku FROM inventory ORDER BY sku")
+    else:
+        rows = query("SELECT DISTINCT sku FROM inventory WHERE hub=? ORDER BY sku", (selected_hub,))
+    return [r[0] for r in rows]
+
+# ---------- Main Inventory page ----------
+def inventory_page(username: str, role: str, user_hub: Optional[str]):
+    if (role or "").lower() == "supplier":
+        st.info("Suppliers do not have access to Inventory. Use Home to create shipments.")
+        return
+
+    st.header("📦 Inventory")
+    selected_hub, _ = render_hub_selector(username, role, user_hub)
+    is_admin_user = is_admin(role)
+    admin_all = is_admin_user and selected_hub is None
+
+    # Table + filter + export
+    df = _inventory_df_for(role, selected_hub if not admin_all else None)
+    with st.container():
+        colf = st.columns([2,1,1])
+        with colf[0]:
+            ftext = st.text_input("Filter by SKU", "", placeholder="Type to filter…")
+        if ftext:
+            df = df[df["SKU"].str.contains(ftext, case=False, na=False)]
+        st.dataframe(df, use_container_width=True, height=380)
+        st.download_button("Export inventory.csv", df.to_csv(index=False).encode("utf-8"), "inventory.csv", "text/csv")
+
+    # Admin optional totals
+    if is_admin_user:
+        with st.expander("Totals by SKU (Admin)", expanded=False):
+            totals = df.groupby("SKU", as_index=False)["Qty"].sum().sort_values("SKU")
+            st.dataframe(totals, use_container_width=True, height=320)
+            st.download_button("Export totals.csv", totals.to_csv(index=False).encode("utf-8"), "inventory_totals.csv", "text/csv")
+
+    st.divider()
+    st.subheader("Quick Adjust (IN / OUT)")
+    with st.form("inout_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns([3,1,1,3])
+        skus = _skus_for_scope(selected_hub, admin_all)
+        with c1:
+            sel_sku = st.selectbox("SKU", options=skus, index=0 if skus else None, placeholder="Select a SKU")
+        with c2:
+            action = st.selectbox("Action", ["IN", "OUT"])
+        with c3:
+            qty = st.number_input("Qty", min_value=1, step=1, value=1)
+        with c4:
+            if admin_all:
+                hubs = _hubs_list()
+                sel_hub_for_txn = st.selectbox("Hub", options=hubs, index=0 if hubs else None, placeholder="Choose hub")
+            else:
+                sel_hub_for_txn = selected_hub
+                st.text_input("Hub", value=sel_hub_for_txn or "", disabled=True)
+        comment = st.text_input("Comment (optional)", "")
+        submitted = st.form_submit_button("Submit")
 
     if submitted:
-        errors = []
-        results = []
-        big_change = False
-        any_change = False
-        for sku, adj, comment in update_data:
+        if not sel_sku:
+            st.warning("Pick a SKU."); return
+        if not sel_hub_for_txn:
+            st.warning("Pick a hub."); return
+        row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sel_sku, sel_hub_for_txn))
+        current = int(row[0][0]) if row else 0
+        if action == "OUT" and qty > current:
+            st.warning(f"Not enough stock to remove {qty}. Current: {current}"); return
+        new_qty = current + qty if action == "IN" else current - qty
+        query("""
+            INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
+            ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
+        """, (sel_sku, sel_hub_for_txn, new_qty), fetch=False, commit=True)
+        try:
+            query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                  (_now_iso(), username, sel_sku, sel_hub_for_txn, action, qty, comment),
+                  fetch=False, commit=True)
+        except Exception:
+            pass
+        st.success(f"Updated {sel_sku} @ {sel_hub_for_txn}: {action} {qty} → New Qty {new_qty}")
+        st.rerun()
+
+    # Admin-only: simple Transfer
+    if is_admin_user:
+        st.divider()
+        with st.expander("🔁 Transfer between hubs (Admin)", expanded=False):
+            hubs_all = _hubs_list()
+            tcols = st.columns(5)
+            src = tcols[0].selectbox("From hub", hubs_all, key="t_src")
+            dst = tcols[1].selectbox("To hub", [h for h in hubs_all if h != src], key="t_dst")
+            sku_t = tcols[2].selectbox("SKU", [r[0] for r in query("SELECT DISTINCT sku FROM inventory ORDER BY sku")], key="t_sku")
+            qty_t = tcols[3].number_input("Qty", min_value=1, step=1, value=1, key="t_qty")
+            note_t = tcols[4].text_input("Note", key="t_note")
+            if st.button("Execute transfer"):
+                # guard source
+                src_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_t, src))
+                src_qty = int(src_row[0][0]) if src_row else 0
+                if qty_t > src_qty:
+                    st.error(f"Not enough at source ({src_qty}).")
+                else:
+                    # OUT source
+                    query("""
+                        INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
+                        ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
+                    """, (sku_t, src, src_qty - qty_t), fetch=False, commit=True)
+                    # IN dest
+                    dst_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_t, dst))
+                    dst_qty = int(dst_row[0][0]) if dst_row else 0
+                    query("""
+                        INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
+                        ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
+                    """, (sku_t, dst, dst_qty + qty_t), fetch=False, commit=True)
+                    # logs
+                    try:
+                        query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                              (_now_iso(), username, sku_t, src, "OUT", qty_t, f"transfer to {dst} | {note_t}"),
+                              fetch=False, commit=True)
+                        query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                              (_now_iso(), username, sku_t, dst, "IN", qty_t, f"transfer from {src} | {note_t}"),
+                              fetch=False, commit=True)
+                    except Exception:
+                        pass
+                    st.success(f"Transferred {qty_t} of {sku_t}: {src} → {dst}")
+                    st.rerun()
+
+    # Cycle Count (Lite) — per-SKU set-to-counted
+    with st.expander("🧮 Cycle Count (Lite)", expanded=False):
+        cc_cols = st.columns(4)
+        cc_hub = selected_hub if not admin_all else cc_cols[0].selectbox("Hub", _hubs_list())
+        cc_sku = cc_cols[1].selectbox("SKU", _skus_for_scope(cc_hub, False))
+        current_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (cc_sku, cc_hub))
+        current_qty = int(current_row[0][0]) if current_row else 0
+        cc_cols[2].metric("Current", current_qty)
+        counted = cc_cols[3].number_input("Counted qty", min_value=0, step=1, value=current_qty)
+        reason = st.text_input("Reason (optional)")
+        if st.button("Apply count"):
+            query("""
+                INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
+                ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
+            """, (cc_sku, cc_hub, int(counted)), fetch=False, commit=True)
+            variance = int(counted) - current_qty
             try:
-                n = int(adj.strip()) if adj.strip() else 0
-            except:
-                n = 0
-            if n == 0:
-                continue
-            any_change = True
-            if abs(n) >= 10:
-                big_change = True
-            record = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku, hub))
-            current = record[0][0] if record else 0
-            new_qty = current + n
-            if new_qty < 0:
-                errors.append(f"❌ Not enough '{sku}' (Now: {current}, Tried: {n})")
-                continue
-            action = "IN" if n > 0 else "OUT"
-            query(
-                """INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
-                   ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity""",
-                (sku, hub, new_qty),
-                fetch=False,
-                commit=True
-            )
-            query(
-                "INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (datetime.now().isoformat(), username, sku, hub, action, abs(n), comment),
-                fetch=False,
-                commit=True
-            )
-            results.append(f"{sku}: {action} {abs(n)} (Now: {new_qty})")
-
-        if not any_change:
-            st.info("No changes submitted.")
-        else:
-            if errors:
-                st.warning("Some updates failed:\n" + "\n".join(errors))
-            if results:
-                st.success("✅ Bulk update complete!\n\n" + "\n".join(results))
-                logs = query("SELECT timestamp, sku, action, qty, comment FROM logs WHERE hub=? ORDER BY timestamp DESC LIMIT 3", (hub,))
-                if logs:
-                    st.markdown("#### Last 3 Inventory Actions:")
-                    st.table(pd.DataFrame(logs, columns=["Time", "SKU", "Action", "Qty", "Comment"]))
-            if big_change:
-                st.balloons()
-        st.rerun()
-
-# --- Logs ---
-if menu == "Logs":
-    st.header(T("activity_logs"))
-    logs = query("SELECT * FROM logs ORDER BY timestamp DESC")
-    df = pd.DataFrame(logs, columns=["Time", "User", "SKU", "Hub", "Action", "Qty", "Comment"])
-    search = st.text_input(T("filter_logs"), placeholder="Type keyword, SKU, user, action...", key="log_search")
-    if search:
-        df = df[df.apply(lambda row: search.lower() in row.astype(str).str.lower().to_string(), axis=1)]
-    st.dataframe(df, use_container_width=True, key="logs_df")
-    buff = io.BytesIO()
-    df.to_csv(buff, index=False)
-    st.download_button("📥 Download CSV of Logs", buff.getvalue(), "logs.csv", "text/csv", key="download_logs_btn")
-
-# --- Count Mode ---
-if menu == "Count":
-    st.header(T("inventory_count_mode"))
-    q = "SELECT sku, hub, quantity FROM inventory"
-    f = ()
-    if role != "Admin":
-        q += " WHERE hub=?"
-        f = (hub,)
-    data = query(q, f)
-    df = pd.DataFrame(data, columns=[T("sku"), T("hub"), T("qty")])
-    df['Status'] = df[T("qty")].apply(lambda x: "🟥 Low" if x < 10 else "✅ OK")
-    st.dataframe(df, use_container_width=True, key="count_df")
-    if role != "Admin":
-        if st.button(T("count_confirmed"), key="btn_count_confirm"):
-            query("INSERT INTO count_confirmations (username, hub, confirmed_at) VALUES (?, ?, ?)",
-                  (username, hub, datetime.now().isoformat()), fetch=False, commit=True)
-            st.success(T("count_confirmed"))
-            st.info(T("refresh"))
-        if st.button(T("refresh"), key="btn_refresh_count"):
-            st.rerun()
-    if role == "Admin":
-        confirms = query("SELECT * FROM count_confirmations ORDER BY confirmed_at DESC")
-        df_confirm = pd.DataFrame(confirms, columns=[T("username"), T("hub"), "Time"])
-        st.subheader(T("confirmed_counts"))
-        st.dataframe(df_confirm, use_container_width=True, key="confirm_counts_df")
-        if st.button(T("refresh"), key="btn_refresh_confirmations"):
+                query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                      (_now_iso(), username, cc_sku, cc_hub, "COUNT_ADJUST", variance, reason or ""),
+                      fetch=False, commit=True)
+            except Exception:
+                pass
+            st.success(f"Count applied. Variance: {variance:+d}")
             st.rerun()
 
-# --- Google Sheets ---
-if menu == "Google Sheets" and role in ["Admin", "Hub Manager", "Retail"]:
-    st.header("📊 Google Sheets Inventory Reference")
-    sheet_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSg2Hyk9x4Uaz2kkBh2PkoKJlnpth6evjHKX9m0FfuxXK28c6HSWYpTaYjYCzI2f5Y0bKm6YUhSCoa9/pubhtml?gid=1829911536&single=true"
-    st.markdown(f'<iframe src="{sheet_url}" width="100%" height="600"></iframe>', unsafe_allow_html=True)
-    st.markdown(f"[Open Google Sheets in new tab]({sheet_url})")
+# --- Main app -----------------------------------------------------------------
+def main():
+    st.set_page_config(page_title="KISS Inventory", layout="wide")
+    st.title("KISS Inventory")
+    st.caption("Keep It Simple Socks — Inventory & Ops")
 
+    # auth gate
+    user = st.session_state.get("auth_user")
+    if not user:
+        login_form()
+        st.stop()
 
-# --- Messages ---
-if menu == "Messages":
-    st.header("📢 Internal Messaging")
-    if role == "Admin":
-        users = [u[0] for u in query("SELECT username FROM users WHERE username != ?", (username,))]
-        to_label = T("to")
-        subject_placeholder = T("subject")
+    username, role, hub = user
+    coltop = st.columns([3,1])
+    with coltop[0]:
+        st.success(f"Welcome, **{username}** ({role}{' — '+hub if hub else ''})")
+    with coltop[1]:
+        if st.button("Log out"):
+            logout(); st.rerun()
+
+    # Sidebar nav based on role
+    unread = unread_count(username)
+    msgs_label = f"Messages 📬 ({unread})" if unread else "Messages 📬"
+
+    nav_items = ["Home", msgs_label]
+    if (role or "").lower() != "supplier":
+        nav_items.insert(1, "Inventory")  # hubs/admins get Inventory; suppliers don't
+    if is_admin(role):
+        nav_items += ["Logs", "Admin"]
+
+    nav = st.sidebar.radio("Navigate", nav_items, index=0)
+
+    # Routing
+    if nav == "Inventory":
+        inventory_page(username, role, hub); st.stop()
+
+    if nav == msgs_label:
+        messaging_page(username, role, hub); st.stop()
+
+    if nav == "Logs" and is_admin(role):
+        admin_logs_page(role); st.stop()
+
+    if nav == "Admin" and is_admin(role):
+        admin_page(role); st.stop()
+
+    # ---- Home pages by role ----
+    if is_admin(role):
+        admin_home_page()
+    elif (role or "").lower() == "supplier":
+        supplier_home_page(username)
     else:
-        users = [u[0] for u in query("SELECT username FROM users WHERE role='Admin'")]
-        to_label = T("to")
-        subject_placeholder = T("subject")
-    st.subheader(T("send_message"))
-    recipient = st.selectbox(to_label, users, key="message_recipient")
-    thread = st.text_input(T("subject"), placeholder=subject_placeholder, key="message_subject")
-    msg = st.text_area(T("message"), placeholder="Type your message here…", key="message_body")
-    if st.button(T("send"), key="btn_send_message"):
-        auto_thread = thread.strip() if thread.strip() else f"{username}-{recipient}"
-        query(
-            "INSERT INTO messages (sender, receiver, message, thread, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (username, recipient, msg, auto_thread, datetime.now().isoformat()),
-            fetch=False,
-            commit=True
-        )
-        st.success("✅ Message sent!")
-        st.rerun()
+        hub_home_page(username, hub)
 
-    st.markdown("---")
-    st.subheader(T("your_threads"))
-    threads = query("SELECT DISTINCT thread FROM messages WHERE sender=? OR receiver=? ORDER BY timestamp DESC", (username, username))
-    for t in threads:
-        thread_msgs = query("SELECT timestamp, sender, message FROM messages WHERE thread=? ORDER BY timestamp", (t[0],))
-        last_msg = thread_msgs[-1] if thread_msgs else None
-        last_from = last_msg[1] if last_msg else ""
-        unread = last_from != username
-        label = f"🧵 {t[0]}"
-        if unread:
-            label = f"**🔵 {label}**"
-        with st.expander(label):
-            for m in thread_msgs:
-                st.markdown(f"**{m[1]}** ({m[0]}): {m[2]}")
-            reply = st.text_input(T("reply"), key=f"reply_input_{t[0]}", placeholder="Type your reply here…")
-            if st.button(T("send_reply"), key=f"reply_btn_{t[0]}"):
-                last_receiver = [m[1] for m in reversed(thread_msgs) if m[1] != username]
-                reply_to = last_receiver[0] if last_receiver else users[0]
-                if role == "Admin" or reply_to in users:
-                    query(
-                        "INSERT INTO messages (sender, receiver, message, thread, timestamp) VALUES (?, ?, ?, ?, ?)",
-                        (username, reply_to, reply, t[0], datetime.now().isoformat()),
-                        fetch=False,
-                        commit=True
-                    )
-                    st.rerun()
-                else:
-                    st.warning(T("only_reply_hq"))
-
-# --- Shipments ---
-if menu == "Shipments":
-    st.header(T("supplier_shipments"))
-    if role == "Supplier":
-        tracking = st.text_input(T("tracking_number"), key="supplier_tracking")
-        carrier = st.text_input(T("carrier"), key="supplier_carrier")
-        hub_dest = st.selectbox(T("destination_hub"), ["Hub 1", "Hub 2", "Hub 3", "Retail"], key="supplier_dest_hub")
-        date = st.date_input(T("shipping_date"), value=datetime.today(), key="supplier_ship_date")
-        if "supplier_skus" not in st.session_state:
-            st.session_state["supplier_skus"] = [{"sku": "", "qty": 1}]
-        supplier_skus = st.session_state["supplier_skus"]
-        all_sku_options = [s[0] for s in query("SELECT sku FROM sku_info")]
-        for i, entry in enumerate(supplier_skus):
-            cols = st.columns([4, 2, 1])
-            with cols[0]:
-                entry["sku"] = st.selectbox(f"{T('sku')} {i+1}", all_sku_options, index=all_sku_options.index(entry["sku"]) if entry["sku"] in all_sku_options else 0, key=f"supp_sku_{i}")
-            with cols[1]:
-                entry["qty"] = st.number_input(f"{T('qty')} {i+1}", min_value=1, step=1, key=f"supp_qty_{i}", value=entry["qty"])
-            with cols[2]:
-                if st.button(T("remove"), key=f"rmv_sku_{i}"):
-                    supplier_skus.pop(i)
-                    st.rerun()
-        if st.button(T("add_another_sku"), key="btn_add_another_sku"):
-            supplier_skus.append({"sku": "", "qty": 1})
-            st.rerun()
-        st.markdown("---")
-        with st.expander(T("create_new_sku")):
-            new_sku = st.text_input(T("new_sku_name"), key="supplier_new_sku")
-            if st.button(T("add_sku"), key="supplier_add_sku"):
-                if new_sku.strip():
-                    query(
-                        "INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?, ?, ?)",
-                        (new_sku.strip(), new_sku.strip(), "Hub 1,Hub 2,Hub 3,Retail"),
-                        fetch=False,
-                        commit=True
-                    )
-                    st.success(f"SKU '{new_sku.strip()}' added.")
-                    st.rerun()
-                else:
-                    st.warning(T("enter_sku_name"))
-        submitted = st.button(T("submit_shipment"), key="submit_supplier_shipment")
-        if submitted:
-            if tracking and carrier and all(e["sku"] for e in supplier_skus):
-                skus_str = ", ".join([f"{e['sku']} x {e['qty']}" for e in supplier_skus if e["sku"]])
-                query(
-                    "INSERT INTO shipments (supplier, tracking, carrier, hub, skus, date, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (username, tracking.strip(), carrier.strip(), hub_dest, skus_str, str(date), "Pending"),
-                    fetch=False,
-                    commit=True
-                )
-                st.success(T("shipment_submitted"))
-                st.session_state["supplier_skus"] = [{"sku": "", "qty": 1}]
-                st.rerun()
-            else:
-                st.error(T("fill_out_required"))
-        filter_text = st.text_input("Filter Shipments (Tracking, Carrier, or Hub):", key="supplier_filter_ship").lower()
-        my_shipments = query("SELECT * FROM shipments WHERE supplier=? AND status!='Deleted' ORDER BY id DESC", (username,))
-        st.markdown("### " + T("your_shipments"))
-        if my_shipments:
-            df_my = pd.DataFrame(my_shipments, columns=["ID", "Supplier", "Tracking", "Carrier", "Hub", "SKUs", "Date", "Status"])
-            if filter_text:
-                df_my = df_my[
-                    df_my["Tracking"].str.lower().str.contains(filter_text) |
-                    df_my["Carrier"].str.lower().str.contains(filter_text) |
-                    df_my["Hub"].str.lower().str.contains(filter_text)
-                ]
-            for idx, row in df_my.iterrows():
-                with st.expander(f"Shipment ID {row['ID']} - Status: {row['Status']}"):
-                    st.write(f"Tracking: {row['Tracking']}")
-                    st.write(f"Carrier: {row['Carrier']}")
-                    st.write(f"Hub: {row['Hub']}")
-                    st.write(f"SKUs: {row['SKUs']}")
-                    st.write(f"Date: {row['Date']}")
-                    if row['Status'] == "Pending":
-                        if st.button(f"Delete Shipment {row['ID']}", key=f"supp_delete_{row['ID']}"):
-                            query("UPDATE shipments SET status='Deleted' WHERE id=?", (row['ID'],), fetch=False, commit=True)
-                            st.success(f"Shipment {row['ID']} deleted.")
-                            st.rerun()
-        else:
-            st.info(T("no_shipments"))
-    else:
-        # Admin/manager/retail: view all shipments except Deleted, mark as received
-        rows = query("SELECT * FROM shipments WHERE status!='Deleted' ORDER BY id DESC")
-        df = pd.DataFrame(rows, columns=["ID", "Supplier", "Tracking", "Carrier", "Hub", "SKUs", "Date", "Status"])
-        st.dataframe(df, use_container_width=True, key="all_shipments_df")
-        pending = df[df["Status"] == "Pending"]
-        if not pending.empty:
-            st.subheader(T("mark_received"))
-            to_confirm = st.selectbox("Select Pending Shipment", pending["ID"].tolist(), key="admin_confirm_ship")
-            confirm = st.checkbox(T("confirm_receipt"), key="admin_confirm_checkbox")
-            if st.button(T("mark_received"), key="btn_admin_confirm_receive"):
-                if confirm:
-                    record = df[df["ID"] == to_confirm].iloc[0]
-                    sku_list = [s.strip() for s in record["SKUs"].split(",") if s.strip()]
-                    for sku in sku_list:
-                        if " x " in sku:
-                            name, qty = sku.rsplit(" x ", 1)
-                            try:
-                                qty = int(qty)
-                            except:
-                                qty = 1
-                        else:
-                            name = sku
-                            qty = 1
-                        current = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (name, record["Hub"]))
-                        curr_qty = current[0][0] if current else 0
-                        new_qty = curr_qty + qty
-                        query(
-                            "INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?) ON CONFLICT(sku, hub) DO UPDATE SET quantity=?",
-                            (name, record["Hub"], new_qty, new_qty),
-                            fetch=False,
-                            commit=True
-                        )
-                        query(
-                            "INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (datetime.now().isoformat(), username, name, record["Hub"], "IN", qty, f"Shipment {record['ID']}"),
-                            fetch=False,
-                            commit=True
-                        )
-                    query("UPDATE shipments SET status='Received' WHERE id=?", (to_confirm,), fetch=False, commit=True)
-                    st.success(T("shipment_confirmed"))
-                    st.rerun()
-        # Admin delete shipment option
-        if role == "Admin":
-            st.markdown("---")
-            st.subheader(T("delete_shipment"))
-            delete_id = st.selectbox("Select Shipment to Delete", df["ID"].tolist(), key="admin_delete_ship_id")
-            confirm_del = st.checkbox(T("confirm_delete"), key="admin_confirm_delete_checkbox")
-            if st.button(T("delete_shipment"), key="btn_admin_delete_shipment"):
-                if confirm_del:
-                    query("UPDATE shipments SET status='Deleted' WHERE id=?", (delete_id,), fetch=False, commit=True)
-                    st.success(T("shipment_deleted"))
-                    st.rerun()
-
-# --- Incoming Shipments for Hub Managers ---
-if menu == "Incoming Shipments" and role == "Hub Manager":
-    st.header(T("incoming_shipments"))
-    incoming = query("SELECT * FROM shipments WHERE hub=? AND status='Pending' ORDER BY date DESC", (hub,))
-    if incoming:
-        df_in = pd.DataFrame(incoming, columns=["ID", "Supplier", "Tracking", "Carrier", "Hub", "SKUs", "Date", "Status"])
-        for idx, row in df_in.iterrows():
-            with st.expander(f"Shipment ID {row['ID']} from {row['Supplier']}"):
-                st.write(f"Tracking: {row['Tracking']}")
-                st.write(f"Carrier: {row['Carrier']}")
-                st.write(f"SKUs: {row['SKUs']}")
-                st.write(f"Date: {row['Date']}")
-                confirm = st.checkbox(f"{T('mark_received')} {row['ID']}", key=f"hubman_confirm_{row['ID']}")
-                if confirm:
-                    sku_list = [s.strip() for s in row["SKUs"].split(",") if s.strip()]
-                    for sku in sku_list:
-                        if " x " in sku:
-                            name, qty = sku.rsplit(" x ", 1)
-                            try:
-                                qty = int(qty)
-                            except:
-                                qty = 1
-                        else:
-                            name = sku
-                            qty = 1
-                        current = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (name, hub))
-                        curr_qty = current[0][0] if current else 0
-                        new_qty = curr_qty + qty
-                        query(
-                            "INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?) ON CONFLICT(sku, hub) DO UPDATE SET quantity=?",
-                            (name, hub, new_qty, new_qty),
-                            fetch=False,
-                            commit=True
-                        )
-                        query(
-                            "INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (datetime.now().isoformat(), username, name, hub, "IN", qty, f"Shipment {row['ID']}"),
-                            fetch=False,
-                            commit=True
-                        )
-                    query("UPDATE shipments SET status='Received' WHERE id=?", (row['ID'],), fetch=False, commit=True)
-                    st.success(T("shipment_confirmed"))
-                    st.rerun()
-    else:
-        st.info("No pending shipments for your hub.")
-
-
-
-
-
+# Make sure this is at the very end of app.py, not inside any function
+if __name__ == "__main__":
+    main()
