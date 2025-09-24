@@ -6,3 +6,4 @@ __pycache__/
 # App data
 ttt_inventory.db
 *.csv
+.DS_Store
