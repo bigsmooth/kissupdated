@@ -10,14 +10,18 @@ import pandas as pd
 
 # --- Config: DB path (env var or local file)
 DB = Path(os.getenv("TTT_DB_PATH", Path(__file__).parent / "ttt_inventory.db"))
+DB.parent.mkdir(parents=True, exist_ok=True)  # make sure folder exists
 
 # --- DB helpers ---------------------------------------------------------------
 def connect():
     con = sqlite3.connect(str(DB))
-    # KISS but safe/fast enough
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
+    # Best-effort PRAGMAs (don’t crash if unsupported)
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return con
 
 def query(sql: str, params: Tuple = (), fetch: bool = True, commit: bool = False):
@@ -81,7 +85,6 @@ def verify_password(plain: str, stored: str) -> bool:
 
 def ensure_users_schema_and_seed():
     con = connect(); cur = con.cursor()
-    # Create table if missing (original columns)
     cur.execute("""CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
         password TEXT,
@@ -125,14 +128,12 @@ def login(username: str, password: str):
     if disabled:
         return None
     if verify_password(password, stored_hash):
-        # auto-upgrade legacy sha256 to bcrypt
         if bcrypt and stored_hash and not stored_hash.startswith("$2"):
             try:
                 new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
                 query("UPDATE users SET password=? WHERE username=?", (new_hash, username), fetch=False, commit=True)
             except Exception:
                 pass
-        # audit login
         try:
             ensure_logs_schema()
             query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
@@ -154,7 +155,7 @@ def login_form():
     if st.button("Sign in"):
         user = login(u.strip(), p)
         if user:
-            st.session_state["auth_user"] = user  # (username, role, hub)
+            st.session_state["auth_user"] = user
             st.session_state["logged_in"] = True
             st.rerun()
         else:
@@ -204,7 +205,6 @@ def unread_count(username: str) -> int:
 def _guard_message_send(sender: str, recipient: str) -> None:
     s_role = get_role(sender) or ""
     r_role = get_role(recipient) or ""
-    # Non-admins may only send to Admins (HQ)
     if (s_role or "").lower() != "admin" and (r_role or "").lower() != "admin":
         raise ValueError("Only Admins (HQ) can be messaged by non-admin users.")
 
@@ -214,7 +214,6 @@ def send_message(sender: str, recipient: str, subject: str, body: str,
                  paid_count: Optional[int]=None, meta: Optional[str]=None):
     import uuid
     ensure_messages_schema()
-    # server-side guard
     _guard_message_send(sender, recipient)
     if not thread_id:
         thread_id = str(uuid.uuid4())
@@ -224,7 +223,6 @@ def send_message(sender: str, recipient: str, subject: str, body: str,
           (_now_iso(), sender, recipient, subject, body, thread_id, msg_type, None, hub,
            shipped_count, range_start, range_end, paid_count, meta),
           fetch=False, commit=True)
-    # audit
     try:
         ensure_logs_schema()
         query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
@@ -387,7 +385,6 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
         if is_admin_user:
             st.info("Admins can use the Compose/Reports tools or reply within threads.")
         else:
-            # Hub reports
             import datetime as dt
             st.subheader("📮 Post Office Drop-off")
             rs = st.date_input("Date", value=dt.date.today(), key="dropoff_date")
@@ -469,17 +466,31 @@ def ensure_shipments_schema():
             cur.execute(f"ALTER TABLE shipments ADD COLUMN {col} {typ}")
     con.commit(); con.close()
 
+def _table_exists(name: str) -> bool:
+    con = connect(); cur = con.cursor()
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    ok = cur.fetchone() is not None
+    con.close()
+    return ok
+
 def create_indices():
     con = connect(); cur = con.cursor()
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_hub_qty ON inventory(hub, quantity)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_hub_date ON shipments(hub, date)")
-    con.commit(); con.close()
+    try:
+        if _table_exists("inventory"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_hub_qty ON inventory(hub, quantity)")
+        if _table_exists("messages"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at)")
+        if _table_exists("logs"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp)")
+        if _table_exists("shipments"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_hub_date ON shipments(hub, date)")
+        con.commit()
+    finally:
+        con.close()
 
 ensure_logs_schema()
 ensure_shipments_schema()
-create_indices()
+create_indices()  # first attempt (guarded)
 
 # --- Home helpers (admin/hub) -------------------------------------------------
 ADMIN_LOW_STOCK = 5
@@ -550,11 +561,9 @@ def restore_csv_tool():
         if not confirm:
             st.warning("Please confirm overwrite to proceed.")
             return
-        # backup
         bkp = backup_db()
         if bkp:
             st.caption(f"Database backed up to: `{bkp}`")
-        # transactional write
         try:
             conn = connect(); cur = conn.cursor()
             conn.execute("BEGIN")
@@ -567,10 +576,8 @@ def restore_csv_tool():
             conn.commit(); conn.close()
             st.success(f"Restored {len(df)} rows into '{tbl}'.")
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            try: conn.rollback()
+            except Exception: pass
             st.error(f"Restore failed and was rolled back: {e}")
 
 def list_backups(limit: int = 50) -> List[Path]:
@@ -751,7 +758,7 @@ def _low_stock_df(hub: str) -> pd.DataFrame:
         """, (hub, LOW_STOCK_THRESHOLD))
     return pd.DataFrame(rows, columns=["SKU","Qty"])
 
-def _recent_shipments_df(hub: str, days: int = 30) -> pd.DataFrame:
+def _recent_shipments_df(hub: str, days: int = 90) -> pd.DataFrame:
     rows = query("""
         SELECT id, date, supplier, tracking, carrier, status
         FROM shipments
@@ -788,7 +795,6 @@ def hub_home_page(username: str, hub: Optional[str]):
         st.info("No recent shipments.")
     else:
         st.dataframe(sdf, use_container_width=True, height=260)
-        # Action controls per open shipment
         open_rows = query("SELECT id, tracking, carrier, skus, status FROM shipments WHERE hub=? AND status IN ('Created','In Transit') ORDER BY id DESC", (hub,))
         if open_rows:
             st.caption("Open shipments (confirm to auto-IN inventory):")
@@ -811,10 +817,6 @@ def hub_home_page(username: str, hub: Optional[str]):
 CARRIERS = ["UPS", "USPS", "FedEx", "DHL", "Other…"]
 
 def _parse_items(s: str) -> Tuple[bool, List[Tuple[str,int]], str]:
-    """
-    Parse items in format: SKU|QTY;SKU|QTY (no spaces needed; we trim).
-    Returns (ok, items, error_msg)
-    """
     if not s or not s.strip():
         return False, [], "Items are required. Format: SKU|QTY;SKU|QTY"
     items: List[Tuple[str,int]] = []
@@ -834,19 +836,15 @@ def _parse_items(s: str) -> Tuple[bool, List[Tuple[str,int]], str]:
     return True, items, ""
 
 def _all_catalog_skus() -> List[str]:
-    """All known SKUs from the catalog."""
     rows = query("SELECT sku FROM sku_info ORDER BY sku")
     return [r[0] for r in rows]
 
 def _ensure_sku_in_catalog(sku: str, hub: Optional[str]):
-    """Make sure a SKU exists in sku_info and is assigned to hub (for convenience)."""
     sku = (sku or "").strip()
     if not sku:
         return
-    # Insert if missing
     query("INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
           (sku, sku, hub or ""), fetch=False, commit=True)
-    # Append hub to assigned_hubs if not present
     rows = query("SELECT assigned_hubs FROM sku_info WHERE sku=?", (sku,))
     if rows:
         hubs = (rows[0][0] or "").split(",") if rows[0][0] else []
@@ -855,7 +853,6 @@ def _ensure_sku_in_catalog(sku: str, hub: Optional[str]):
             hubs.append(hub)
             query("UPDATE sku_info SET assigned_hubs=? WHERE sku=?", (",".join(sorted(set(hubs))), sku),
                   fetch=False, commit=True)
-    # Ensure inventory row exists for that hub, qty 0
     if hub:
         query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
               (sku, hub, 0), fetch=False, commit=True)
@@ -876,7 +873,6 @@ def supplier_home_page(username: str):
     trk = st.text_input("Tracking (optional)")
 
     st.markdown("### Items")
-    # Filter + checklist
     filter_text = st.text_input("Filter SKUs", "", placeholder="Type to narrow the list…")
     catalog = _all_catalog_skus()
     shown = [s for s in catalog if filter_text.lower() in s.lower()] if filter_text else catalog
@@ -893,12 +889,10 @@ def supplier_home_page(username: str):
             if checked:
                 selected.append((sku, int(qty_val)))
 
-    # Optional: add a new color/SKU that’s not listed yet
     with st.expander("➕ Add new color / SKU (optional)", expanded=False):
         new_sku = st.text_input("New color / SKU name", placeholder="e.g., Ocean Teal Solid")
         new_qty = st.number_input("Qty (for the new SKU)", min_value=0, step=1, value=0)
 
-    # Build preview summary
     preview_items = list(selected)
     if (new_sku or "").strip() and new_qty > 0:
         preview_items.append((new_sku.strip(), int(new_qty)))
@@ -912,13 +906,10 @@ def supplier_home_page(username: str):
         if not preview_items:
             st.warning("Please select at least one SKU with qty.")
         else:
-            # Ensure new SKU exists in catalog and assigned to hub
             if (new_sku or "").strip() and new_qty > 0:
                 _ensure_sku_in_catalog(new_sku.strip(), hub_sel)
-            # Ensure selected catalog SKUs assigned to hub
             for sku, _q in selected:
                 _ensure_sku_in_catalog(sku, hub_sel)
-            # Compile items format
             items_str = ";".join([f"{sku}|{qty}" for sku, qty in preview_items])
             carrier_final = car_text.strip() if car_sel == "Other…" else car_sel
             query("""INSERT INTO shipments (supplier, tracking, carrier, hub, skus, date, status)
@@ -943,7 +934,6 @@ def supplier_home_page(username: str):
             with c[0]:
                 st.caption(f"Items: {sskus}")
             with c[1]:
-                # Edit carrier (if not received)
                 if sst != "Received":
                     curr = scar or ""
                     choices = CARRIERS + ["(keep)"]
@@ -968,7 +958,6 @@ def supplier_home_page(username: str):
                 else:
                     st.caption(f"Carrier: {scar or '—'}")
             with c[2]:
-                # Edit tracking (if not received)
                 if sst != "Received":
                     new_trk = st.text_input("Tracking", value=strk or "", key=f"trk_{sid}")
                     if st.button("Save tracking", key=f"tsave_{sid}"):
@@ -1006,7 +995,6 @@ def _confirm_receive_shipment(sid: int, hub: str, username: str) -> Tuple[bool,s
     if not ok:
         return False, f"Could not parse items: {err}"
 
-    # Apply IN per item
     for sku, qty in items:
         sku_norm = sku.strip()
         r = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_norm, hub))
@@ -1016,10 +1004,8 @@ def _confirm_receive_shipment(sid: int, hub: str, username: str) -> Tuple[bool,s
             INSERT INTO inventory (sku, hub, quantity) VALUES (?,?,?)
             ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
         """, (sku_norm, hub, new_qty), fetch=False, commit=True)
-        # ensure sku_info row exists (KISS auto-create)
         query("INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
               (sku_norm, sku_norm, hub), fetch=False, commit=True)
-        # log
         try:
             query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
                   (_now_iso(), username, sku_norm, hub, "IN", qty, f"from shipment #{sid} tracking={tracking or ''} carrier={carrier or ''}"),
@@ -1027,11 +1013,9 @@ def _confirm_receive_shipment(sid: int, hub: str, username: str) -> Tuple[bool,s
         except Exception:
             pass
 
-    # finalize shipment
     query("UPDATE shipments SET status='Received', received_at=?, received_by=? WHERE id=?",
           (_now_iso(), username, sid), fetch=False, commit=True)
 
-    # notify admins (optional but nice)
     admins = [u[0] for u in query("SELECT username FROM users WHERE LOWER(role)='admin'")]
     subj = f"[RECEIVED] Hub {hub} shipment #{sid}"
     body = f"Hub {hub} received shipment #{sid}. Tracking={tracking or '—'}"
@@ -1067,7 +1051,6 @@ def ensure_sku_inventory_schemas():
     con.commit(); con.close()
 
 def _seed_all_skus():
-    # Minimal seed for demo; keep your existing long list if desired
     hub_assignments = {
         "Hub 1": ["All American Stripes","Carolina Blue and White Stripes","Navy and Silver Stripes",
                   "Black and Hot Pink Stripes","Bubble Gum and White Stripes","White and Ice Blue Stripes",
@@ -1128,9 +1111,9 @@ def seed_sku_inventory_if_empty():
 
 ensure_sku_inventory_schemas()
 seed_sku_inventory_if_empty()
+create_indices()  # run again now that tables exist
 
 # ===== Section 7: Inventory (clean Hubs UI + list + IN/OUT + transfer + count)
-# ---------- Hubs UI helpers ----------
 def _hub_stats() -> pd.DataFrame:
     rows = query("""
         SELECT hub, COUNT(DISTINCT sku) AS sku_count, COALESCE(SUM(quantity), 0) AS total_qty
@@ -1189,7 +1172,6 @@ def render_hub_selector(username: str, role: str, user_hub: Optional[str]) -> Tu
     raw = opts[nice_opts.index(sel_nice)]
     selected_hub = None if raw == "All hubs" else raw
 
-    # chip
     if selected_hub:
         skus, qty = stats.get(selected_hub, (0, 0))
         chip = f"{selected_hub} · {skus} SKUs · {qty} pcs"
@@ -1208,7 +1190,6 @@ def render_hub_selector(username: str, role: str, user_hub: Optional[str]) -> Tu
                          use_container_width=True, hide_index=True)
     return (selected_hub, raw)
 
-# ---------- Data helpers ----------
 def _inventory_df_for(role: str, selected_hub: Optional[str]) -> pd.DataFrame:
     if (role or "").lower() == "admin" and selected_hub is None:
         rows = query("SELECT sku, hub, quantity FROM inventory ORDER BY hub, sku")
@@ -1223,7 +1204,6 @@ def _skus_for_scope(selected_hub: Optional[str], admin_all: bool) -> List[str]:
         rows = query("SELECT DISTINCT sku FROM inventory WHERE hub=? ORDER BY sku", (selected_hub,))
     return [r[0] for r in rows]
 
-# ---------- Main Inventory page ----------
 def inventory_page(username: str, role: str, user_hub: Optional[str]):
     if (role or "").lower() == "supplier":
         st.info("Suppliers do not have access to Inventory. Use Home to create shipments.")
@@ -1234,7 +1214,6 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
     is_admin_user = is_admin(role)
     admin_all = is_admin_user and selected_hub is None
 
-    # Table + filter + export
     df = _inventory_df_for(role, selected_hub if not admin_all else None)
     with st.container():
         colf = st.columns([2,1,1])
@@ -1245,7 +1224,6 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
         st.dataframe(df, use_container_width=True, height=380)
         st.download_button("Export inventory.csv", df.to_csv(index=False).encode("utf-8"), "inventory.csv", "text/csv")
 
-    # Admin optional totals
     if is_admin_user:
         with st.expander("Totals by SKU (Admin)", expanded=False):
             totals = df.groupby("SKU", as_index=False)["Qty"].sum().sort_values("SKU")
@@ -1296,7 +1274,6 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
         st.success(f"Updated {sel_sku} @ {sel_hub_for_txn}: {action} {qty} → New Qty {new_qty}")
         st.rerun()
 
-    # Admin-only: simple Transfer
     if is_admin_user:
         st.divider()
         with st.expander("🔁 Transfer between hubs (Admin)", expanded=False):
@@ -1308,25 +1285,21 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
             qty_t = tcols[3].number_input("Qty", min_value=1, step=1, value=1, key="t_qty")
             note_t = tcols[4].text_input("Note", key="t_note")
             if st.button("Execute transfer"):
-                # guard source
                 src_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_t, src))
                 src_qty = int(src_row[0][0]) if src_row else 0
                 if qty_t > src_qty:
                     st.error(f"Not enough at source ({src_qty}).")
                 else:
-                    # OUT source
                     query("""
                         INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
                         ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
                     """, (sku_t, src, src_qty - qty_t), fetch=False, commit=True)
-                    # IN dest
                     dst_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_t, dst))
                     dst_qty = int(dst_row[0][0]) if dst_row else 0
                     query("""
                         INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
                         ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
                     """, (sku_t, dst, dst_qty + qty_t), fetch=False, commit=True)
-                    # logs
                     try:
                         query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
                               (_now_iso(), username, sku_t, src, "OUT", qty_t, f"transfer to {dst} | {note_t}"),
@@ -1339,30 +1312,32 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
                     st.success(f"Transferred {qty_t} of {sku_t}: {src} → {dst}")
                     st.rerun()
 
-    # Cycle Count (Lite) — per-SKU set-to-counted
     with st.expander("🧮 Cycle Count (Lite)", expanded=False):
         cc_cols = st.columns(4)
         cc_hub = selected_hub if not admin_all else cc_cols[0].selectbox("Hub", _hubs_list())
-        cc_sku = cc_cols[1].selectbox("SKU", _skus_for_scope(cc_hub, False))
-        current_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (cc_sku, cc_hub))
+        cc_sku = cc_cols[1].selectbox("SKU", _skus_for_scope(cc_hub, False) if cc_hub else [])
+        current_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (cc_sku, cc_hub)) if cc_hub and cc_sku else [(0,)]
         current_qty = int(current_row[0][0]) if current_row else 0
         cc_cols[2].metric("Current", current_qty)
         counted = cc_cols[3].number_input("Counted qty", min_value=0, step=1, value=current_qty)
         reason = st.text_input("Reason (optional)")
         if st.button("Apply count"):
-            query("""
-                INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
-                ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
-            """, (cc_sku, cc_hub, int(counted)), fetch=False, commit=True)
-            variance = int(counted) - current_qty
-            try:
-                query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
-                      (_now_iso(), username, cc_sku, cc_hub, "COUNT_ADJUST", variance, reason or ""),
-                      fetch=False, commit=True)
-            except Exception:
-                pass
-            st.success(f"Count applied. Variance: {variance:+d}")
-            st.rerun()
+            if not cc_hub or not cc_sku:
+                st.warning("Select hub and SKU."); 
+            else:
+                query("""
+                    INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
+                    ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
+                """, (cc_sku, cc_hub, int(counted)), fetch=False, commit=True)
+                variance = int(counted) - current_qty
+                try:
+                    query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                          (_now_iso(), username, cc_sku, cc_hub, "COUNT_ADJUST", variance, reason or ""),
+                          fetch=False, commit=True)
+                except Exception:
+                    pass
+                st.success(f"Count applied. Variance: {variance:+d}")
+                st.rerun()
 
 # --- Main app -----------------------------------------------------------------
 def main():
@@ -1390,26 +1365,22 @@ def main():
 
     nav_items = ["Home", msgs_label]
     if (role or "").lower() != "supplier":
-        nav_items.insert(1, "Inventory")  # hubs/admins get Inventory; suppliers don't
+        nav_items.insert(1, "Inventory")
     if is_admin(role):
         nav_items += ["Logs", "Admin"]
 
     nav = st.sidebar.radio("Navigate", nav_items, index=0)
 
-    # Routing
     if nav == "Inventory":
         inventory_page(username, role, hub); st.stop()
-
     if nav == msgs_label:
         messaging_page(username, role, hub); st.stop()
-
     if nav == "Logs" and is_admin(role):
         admin_logs_page(role); st.stop()
-
     if nav == "Admin" and is_admin(role):
         admin_page(role); st.stop()
 
-    # ---- Home pages by role ----
+    # Homes
     if is_admin(role):
         admin_home_page()
     elif (role or "").lower() == "supplier":
