@@ -819,22 +819,31 @@ def admin_home_page():
 
     st.divider()
     t1, t2 = st.tabs(["🏬 Hubs overview", "⚠️ Low stock (all hubs)"])
+
     with t1:
         dfh = _hubs_overview_df()
-        st.dataframe(dfh, use_container_width=True, hide_index=True) if not dfh.empty else st.info("No hub data yet.")
+        if dfh is None or dfh.empty:
+            st.info("No hub data yet.")
+        else:
+            st.dataframe(dfh, use_container_width=True, hide_index=True)
+
     with t2:
         dfl = _low_stock_all_df()
-        if dfl.empty:
+        if dfl is None or dfl.empty:
             st.success("No low-stock items across hubs.")
         else:
             st.dataframe(dfl, use_container_width=True, height=320)
-            st.download_button("Export low_stock_all.csv", dfl.to_csv(index=False).encode("utf-8"),
-                               "low_stock_all.csv", "text/csv")
+            st.download_button(
+                "Export low_stock_all.csv",
+                dfl.to_csv(index=False).encode("utf-8"),
+                "low_stock_all.csv",
+                "text/csv",
+            )
 
     st.divider()
     st.subheader("📦 Shipments (last 30 days)")
     dfs = _shipments_overview_df(30)
-    if dfs.empty:
+    if dfs is None or dfs.empty:
         st.info("No shipments in the last 30 days.")
     else:
         st.dataframe(dfs, use_container_width=True, height=300)
@@ -851,6 +860,7 @@ def admin_home_page():
         if cols[4].button("Enable" if dis else "Disable", key=f"ud_{uname}"):
             query("UPDATE users SET disabled=? WHERE username=?", (0 if dis else 1, uname), fetch=False, commit=True)
             st.rerun()
+
 
 def logs_table_filtered():
     st.subheader("🧾 Logs")
