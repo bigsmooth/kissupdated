@@ -1,4 +1,4 @@
-# ===== app.py — KISS Inventory (Reports & Drop-offs, KISS) =====
+# ===== app.py — KISS Inventory =====
 import os
 from pathlib import Path
 import sqlite3
@@ -7,42 +7,39 @@ from typing import Optional, Dict, List, Tuple
 
 import streamlit as st
 import pandas as pd
+from zoneinfo import ZoneInfo  # NEW: for ET handling
 
-# For Eastern time formatting
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+# --- Timezone helpers (KISS: store naive ET, display nice ET) -----------------
+ET_TZ = ZoneInfo("America/New_York")
 
-# --- Config: DB path (env var or local file)
+def _now_iso() -> str:
+    """Return current time in ET as 'YYYY-MM-DD HH:MM:SS' (no TZ in string)."""
+    return datetime.now(ET_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def fmt_ts_et(ts: str) -> str:
+    """
+    Format a DB timestamp string as Eastern 12-hour like:
+    'Fri Sep 26, 2025 • 10:37 AM ET'
+    Accepts 'YYYY-MM-DD HH:MM:SS' or ISO-ish strings. Falls back to raw.
+    """
+    try:
+        # Try 'YYYY-MM-DD HH:MM:SS'
+        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET_TZ)
+        return dt.strftime("%a %b %d, %Y • %I:%M %p ET")
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ET_TZ)
+            else:
+                dt = dt.astimezone(ET_TZ)
+            return dt.strftime("%a %b %d, %Y • %I:%M %p ET")
+        except Exception:
+            return ts
+
+# --- Config: DB path (env var or local file) ---------------------------------
 DB = Path(os.getenv("TTT_DB_PATH", Path(__file__).parent / "ttt_inventory.db"))
 DB.parent.mkdir(parents=True, exist_ok=True)  # make sure folder exists
-
-# --- Time helpers (ET, 12-hour) ----------------------------------------------
-ET_TZ = ZoneInfo("America/New_York") if ZoneInfo else None
-
-def _now_dt_et():
-    if ET_TZ:
-        return datetime.now(ET_TZ)
-    return datetime.now()
-
-def _fmt_12h(dt: datetime) -> str:
-    s = dt.strftime("%I:%M %p")
-    return s[1:] if s.startswith("0") else s
-
-def _human_et(dt: datetime) -> str:
-    return dt.strftime("%a %b %d, %Y • ") + _fmt_12h(dt) + " ET"
-
-def format_iso_as_et_human(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        if ET_TZ:
-            dt = dt.replace(tzinfo=ET_TZ)
-        return _human_et(dt)
-    except Exception:
-        return iso_str
 
 # --- DB helpers ---------------------------------------------------------------
 def connect():
@@ -72,50 +69,17 @@ def execmany(sql: str, rows: List[Tuple]):
     con.commit()
     con.close()
 
-def _now_iso():
-    return datetime.now().isoformat(timespec="seconds")
-
-# --- Backups & Settings -------------------------------------------------------
+# --- Safety: backup the SQLite DB before destructive operations ---------------
 def backup_db() -> Optional[Path]:
     try:
         db_path = Path(DB)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        ts = datetime.now(ET_TZ).strftime("%Y%m%d-%H%M%S")
         backup = db_path.with_name(f"{db_path.stem}-{ts}{db_path.suffix}")
         import shutil
         shutil.copy2(db_path, backup)
         return backup
     except Exception:
         return None
-
-def ensure_settings_schema():
-    query("""CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""", fetch=False, commit=True)
-
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    rows = query("SELECT value FROM settings WHERE key=?", (key,))
-    return rows[0][0] if rows else default
-
-def set_setting(key: str, value: str):
-    query("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value), fetch=False, commit=True)
-
-def list_backups(limit: int = 50) -> List[Path]:
-    p = Path(DB).with_name(f"{Path(DB).stem}-*{Path(DB).suffix}")
-    return sorted(Path(DB).parent.glob(p.name), reverse=True)[:limit]
-
-def _backup_exists_today() -> bool:
-    today = datetime.now().strftime("%Y%m%d")
-    for p in list_backups(200):
-        if f"-{today}-" in p.name:
-            return True
-    return False
-
-def maybe_daily_auto_backup():
-    ensure_settings_schema()
-    enabled = get_setting("auto_backup_enabled", "0")
-    if enabled == "1" and not _backup_exists_today():
-        backup_db()
 
 # ===== section 2: auth (bcrypt + legacy), users table, seeding ================
 try:
@@ -130,6 +94,7 @@ def hash_password(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
 def verify_password(plain: str, stored: str) -> bool:
+    # bcrypt hash?
     if stored and stored.startswith("$2"):
         if not bcrypt:
             return False
@@ -137,6 +102,7 @@ def verify_password(plain: str, stored: str) -> bool:
             return bcrypt.checkpw(plain.encode(), stored.encode())
         except Exception:
             return False
+    # legacy sha256 (64 hex)
     import re, hashlib
     if re.fullmatch(r"[0-9a-f]{64}", stored or ""):
         return hashlib.sha256(plain.encode()).hexdigest() == stored
@@ -150,12 +116,12 @@ def ensure_users_schema_and_seed():
         role TEXT,
         hub TEXT
     )""")
+    # MIGRATION: add 'disabled' column if missing
     cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "disabled" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN disabled INTEGER DEFAULT 0")
         cur.execute("UPDATE users SET disabled=0 WHERE disabled IS NULL")
-    con.commit()
-
+    # Seed only if empty
     cur.execute("SELECT COUNT(*) FROM users")
     n = cur.fetchone()[0]
     if n == 0:
@@ -168,8 +134,7 @@ def ensure_users_schema_and_seed():
             ("angie",   hash_password("shipit"),     "Supplier",    None,    0),
         ]
         cur.executemany("INSERT INTO users (username,password,role,hub,disabled) VALUES (?,?,?,?,?)", seed)
-        con.commit()
-    con.close()
+    con.commit(); con.close()
 
 ensure_users_schema_and_seed()
 
@@ -188,12 +153,14 @@ def login(username: str, password: str):
     if disabled:
         return None
     if verify_password(password, stored_hash):
+        # auto-upgrade legacy sha256 to bcrypt
         if bcrypt and stored_hash and not stored_hash.startswith("$2"):
             try:
                 new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
                 query("UPDATE users SET password=? WHERE username=?", (new_hash, username), fetch=False, commit=True)
             except Exception:
                 pass
+        # best-effort login log
         try:
             ensure_logs_schema()
             query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
@@ -208,6 +175,13 @@ def logout():
         if k in st.session_state:
             del st.session_state[k]
 
+def _last_login_for(user: str) -> Optional[str]:
+    try:
+        r = query("SELECT timestamp FROM logs WHERE user=? AND action='login' ORDER BY id DESC LIMIT 1", (user,))
+        return r[0][0] if r else None
+    except Exception:
+        return None
+
 def login_form():
     st.subheader("Log in")
     u = st.text_input("Username")
@@ -215,7 +189,7 @@ def login_form():
     if st.button("Sign in"):
         user = login(u.strip(), p)
         if user:
-            st.session_state["auth_user"] = user
+            st.session_state["auth_user"] = user  # (username, role, hub)
             st.session_state["logged_in"] = True
             st.rerun()
         else:
@@ -241,6 +215,7 @@ def ensure_messages_schema():
         paid_count INTEGER,
         meta TEXT
     )""")
+    # Ensure columns exist
     have = [r[1] for r in cur.execute("PRAGMA table_info(messages)").fetchall()]
     required = {
         "recipient":"TEXT","subject":"TEXT","body":"TEXT",
@@ -264,6 +239,7 @@ def unread_count(username: str) -> int:
 def _guard_message_send(sender: str, recipient: str) -> None:
     s_role = get_role(sender) or ""
     r_role = get_role(recipient) or ""
+    # Hubs/suppliers/etc can only message Admin (HQ). Admins can message anyone.
     if (s_role or "").lower() != "admin" and (r_role or "").lower() != "admin":
         raise ValueError("Only Admins (HQ) can be messaged by non-admin users.")
 
@@ -282,6 +258,7 @@ def send_message(sender: str, recipient: str, subject: str, body: str,
           (_now_iso(), sender, recipient, subject, body, thread_id, msg_type, None, hub,
            shipped_count, range_start, range_end, paid_count, meta),
           fetch=False, commit=True)
+    # best-effort audit
     try:
         ensure_logs_schema()
         query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
@@ -296,10 +273,6 @@ def mark_thread_read(username: str, thread_id: str):
     query("UPDATE messages SET read_at=? WHERE recipient=? AND thread_id=? AND read_at IS NULL",
           (_now_iso(), username, thread_id), fetch=False, commit=True)
 
-def mark_all_read(username: str):
-    query("UPDATE messages SET read_at=? WHERE recipient=? AND read_at IS NULL",
-          (_now_iso(), username), fetch=False, commit=True)
-
 def get_inbox(username: str, only_unread: bool=False):
     ensure_messages_schema()
     sql = "SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE recipient=?"
@@ -313,11 +286,6 @@ def get_sent(username: str):
     return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE sender=? ORDER BY timestamp DESC",
                  (username,))
 
-def get_thread(thread_id: str):
-    ensure_messages_schema()
-    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
-                 (thread_id,))
-
 def shipments_count_for(hub: str, start: str, end: str) -> int:
     try:
         rows = query("SELECT COUNT(*) FROM shipments WHERE hub=? AND date(date) BETWEEN date(?) AND date(?)",
@@ -325,71 +293,6 @@ def shipments_count_for(hub: str, start: str, end: str) -> int:
         return int(rows[0][0]) if rows else 0
     except Exception:
         return 0
-
-# --- Reports helpers (KISS) ---------------------------------------------------
-def dropoff_totals(hub: Optional[str], d1: str, d2: str) -> Tuple[int, pd.DataFrame]:
-    """
-    Returns (total_dropoffs, df_breakdown)
-    If hub is None => all hubs; breakdown is by hub.
-    If hub is set => breakdown is by day.
-    """
-    if hub:
-        total = query(
-            """SELECT COALESCE(SUM(shipped_count),0)
-               FROM messages
-               WHERE msg_type='dropoff_report' AND hub=? AND date(timestamp) BETWEEN date(?) AND date(?)""",
-            (hub, d1, d2),
-        )[0][0]
-        rows = query(
-            """SELECT date(timestamp) AS day, COALESCE(SUM(shipped_count),0) AS cnt
-               FROM messages
-               WHERE msg_type='dropoff_report' AND hub=? AND date(timestamp) BETWEEN date(?) AND date(?)
-               GROUP BY date(timestamp)
-               ORDER BY day""",
-            (hub, d1, d2),
-        )
-        df = pd.DataFrame(rows, columns=["Date","Drop-offs"])
-        return int(total or 0), df
-    else:
-        total = query(
-            """SELECT COALESCE(SUM(shipped_count),0)
-               FROM messages
-               WHERE msg_type='dropoff_report' AND date(timestamp) BETWEEN date(?) AND date(?)""",
-            (d1, d2),
-        )[0][0]
-        rows = query(
-            """SELECT hub, COALESCE(SUM(shipped_count),0) AS cnt
-               FROM messages
-               WHERE msg_type='dropoff_report' AND date(timestamp) BETWEEN date(?) AND date(?)
-               GROUP BY hub
-               ORDER BY hub""",
-            (d1, d2),
-        )
-        df = pd.DataFrame(rows, columns=["Hub","Drop-offs"])
-        return int(total or 0), df
-
-def top5_out_skus(hub: Optional[str], d1: str, d2: str) -> pd.DataFrame:
-    if hub:
-        rows = query(
-            """SELECT sku, COALESCE(SUM(qty),0) AS total
-               FROM logs
-               WHERE action='OUT' AND hub=? AND sku IS NOT NULL AND date(timestamp) BETWEEN date(?) AND date(?)
-               GROUP BY sku
-               ORDER BY total DESC
-               LIMIT 5""",
-            (hub, d1, d2),
-        )
-    else:
-        rows = query(
-            """SELECT sku, COALESCE(SUM(qty),0) AS total
-               FROM logs
-               WHERE action='OUT' AND sku IS NOT NULL AND date(timestamp) BETWEEN date(?) AND date(?)
-               GROUP BY sku
-               ORDER BY total DESC
-               LIMIT 5""",
-            (d1, d2),
-        )
-    return pd.DataFrame(rows, columns=["SKU","OUT qty"])
 
 # ===== section 4: messaging UI page ==========================================
 def messaging_page(current_user: str, role: str, hub: Optional[str]):
@@ -402,27 +305,17 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
 
     is_admin_user = is_admin(role)
 
-    # Tabs: add separate Drop-offs tab; Reports is for both roles.
+    # Tabs: Admin sees all; others see Inbox, Message HQ, Drop-offs, Reports
     if is_admin_user:
         tabs = st.tabs(["📥 Inbox","📤 Sent","✍️ Compose","📮 Drop-offs","📊 Reports"])
-        drop_tab_idx = 3
-        reports_tab_idx = 4
     else:
         tabs = st.tabs(["📥 Inbox","📨 Message HQ","📮 Drop-offs","📊 Reports"])
-        drop_tab_idx = 2
-        reports_tab_idx = 3
 
     # --- inbox ---
     with tabs[0]:
-        c = st.columns([1,2,2])
-        with c[0]:
-            if st.button("Mark all read"):
-                mark_all_read(current_user); st.rerun()
-        with c[1]:
+        c1, c2 = st.columns([1,2])
+        with c1:
             show_unread = st.checkbox("Show only unread", value=False)
-        with c[2]:
-            pass
-
         inbox = get_inbox(current_user, only_unread=show_unread)
         if not inbox:
             st.info("No messages.")
@@ -430,10 +323,10 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
             threads: Dict[str, list] = {}
             for r in inbox:
                 threads.setdefault(r[6], []).append(r)
-            for tid, items in list(threads.items())[:100]:
+            for tid, items in list(threads.items())[:200]:
                 latest = items[0]
-                unread = any(it[8] is None and it[3]==current_user for it in items)
-                label = f"{'🔵 ' if unread else ''}{latest[2]} • {latest[4]} • {format_iso_as_et_human(latest[1])}"
+                unread_flag = any(it[8] is None and it[3]==current_user for it in items)
+                label = f"{'🔵 ' if unread_flag else ''}{latest[2]} • {latest[4]} • {fmt_ts_et(latest[1])}"
                 with st.expander(label, expanded=False):
                     for it in items[::-1]:
                         _id, ts, snd, rcp, sub, body, _t, mtype, r_at, _hub, scnt, rs, re_, pcnt = it
@@ -441,13 +334,14 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                         if mtype=="shipped_report": badge="🟣 Shipped"
                         elif mtype=="paid_notice": badge="🟢 Paid"
                         elif mtype=="dropoff_report": badge="🟠 Drop-off"
-                        st.markdown(f"**{snd} → {rcp}** · _{format_iso_as_et_human(ts)}_ · {badge}")
+                        st.markdown(f"**{snd} → {rcp}** · _{fmt_ts_et(ts)}_ · {badge}")
                         st.write(body)
                         if scnt is not None and (mtype in ("shipped_report","dropoff_report")):
                             if rs and re_:
                                 st.caption(f"Count: {scnt} ({rs} → {re_})")
                         if pcnt is not None: st.caption(f"Paid: {pcnt}")
                         st.divider()
+
                     cols = st.columns([1,2,2])
                     if cols[0].button("Mark read", key=f"mr_{tid}"):
                         mark_thread_read(current_user, tid); st.rerun()
@@ -456,6 +350,8 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                         to = latest[2] if latest[2]!=current_user else latest[3]
                         try:
                             send_message(current_user, to, subject=latest[4], body=reply, msg_type="message", thread_id=tid, hub=hub)
+                            # NEW: auto-mark read on reply
+                            mark_thread_read(current_user, tid)
                             st.success("Reply sent."); st.rerun()
                         except ValueError as e:
                             st.error(str(e))
@@ -466,6 +362,8 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                             try:
                                 send_message(current_user, to, subject=f"[PAID] {latest[4]}", body=f"Paid for {int(paid)} orders.",
                                              msg_type="paid_notice", thread_id=tid, hub=hub, paid_count=int(paid))
+                                # NEW: auto-mark read on paid notice send
+                                mark_thread_read(current_user, tid)
                                 st.success("Paid notice sent."); st.rerun()
                             except ValueError as e:
                                 st.error(str(e))
@@ -477,9 +375,14 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
             if not sent:
                 st.info("No sent messages.")
             else:
-                df = pd.DataFrame(sent, columns=["id","timestamp","sender","recipient","subject","body","thread_id","msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count"])
+                df = pd.DataFrame(
+                    sent,
+                    columns=["id","timestamp","sender","recipient","subject","body","thread_id","msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count"]
+                )
+                # Pretty timestamp column (display only)
+                if not df.empty:
+                    df["timestamp"] = df["timestamp"].apply(fmt_ts_et)
                 st.dataframe(df, use_container_width=True, height=400)
-                st.download_button("Export sent.csv", df.to_csv(index=False).encode("utf-8"), "sent_messages.csv", "text/csv")
 
     # --- compose / message HQ ---
     compose_tab = tabs[2] if is_admin_user else tabs[1]
@@ -522,14 +425,11 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                 if err:
                     st.error(f"{err} message(s) blocked by policy.")
 
-    # --- Drop-offs tab (hubs submit here; admins see info) ---
-    with tabs[drop_tab_idx]:
-        if is_admin_user:
-            st.info("Admins don’t submit drop-offs. Use the Reports tab to view totals.")
-        else:
-            import datetime as dt
+    # --- Drop-offs (everyone can view/submit) ---------------------------------
+    with tabs[2 if not is_admin_user else 3]:
+        if not is_admin_user:
             st.subheader("📮 Post Office Drop-off")
-            rs = st.date_input("Date", value=dt.date.today(), key="dropoff_date")
+            rs = st.date_input("Date", value=date.today(), key="dropoff_date")
             drop = st.number_input("Orders dropped off", min_value=0, step=1, key="dropoff_cnt")
             note = st.text_input("Note (optional)", key="dropoff_note")
             if st.button("Send drop-off report"):
@@ -547,53 +447,85 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                         except ValueError:
                             pass
                     st.success(f"Reported {int(drop)} orders dropped off.")
+        else:
+            st.subheader("📮 Drop-offs — Last 30 days (all hubs)")
+            rows = query("""
+                SELECT hub, timestamp, sender, subject, shipped_count
+                FROM messages
+                WHERE msg_type='dropoff_report' AND date(timestamp) >= date('now','-30 days')
+                ORDER BY date(timestamp) DESC
+            """)
+            if not rows:
+                st.info("No drop-off reports yet.")
+            else:
+                df = pd.DataFrame(rows, columns=["Hub","When","From","Subject","Orders"])
+                if not df.empty:
+                    df["When"] = df["When"].apply(fmt_ts_et)
+                st.dataframe(df, use_container_width=True, height=360)
 
-    # --- Reports tab (for hubs and admins, KISS) ---
-    with tabs[reports_tab_idx]:
-        st.subheader("📊 Reports")
-        col = st.columns(3)
-        with col[0]:
-            d1 = st.date_input("From", value=date.today()-timedelta(days=30), key="rep_from")
-        with col[1]:
-            d2 = st.date_input("To", value=date.today(), key="rep_to")
-        scope_hub: Optional[str] = None
+    # --- Reports (KISS summaries) ---------------------------------------------
+    with tabs[-1]:
         if is_admin_user:
-            hubs_all = [r[0] for r in query("SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL ORDER BY hub")]
-            scope = st.selectbox("Scope", ["All hubs"] + hubs_all if hubs_all else ["All hubs"])
-            scope_hub = None if scope == "All hubs" else scope
-        else:
-            scope_hub = hub
-
-        if d1 > d2:
-            st.warning("From must be earlier than To.")
-        else:
-            total, breakdown = dropoff_totals(scope_hub, d1.isoformat(), d2.isoformat())
-            mcols = st.columns(2)
-            mcols[0].metric("Total Drop-offs", total)
-            if scope_hub:
-                st.caption(f"Daily drop-offs — {scope_hub}")
-                st.dataframe(breakdown, use_container_width=True, height=260)
-                st.download_button("Export dropoffs_daily.csv", breakdown.to_csv(index=False).encode("utf-8"),
-                                   "dropoffs_daily.csv", "text/csv")
+            st.subheader("Admin Reports")
+            rtab = st.radio("Report", ["Drop-offs by hub (last 30d)", "Top 5 SKUs by hub (on hand)"], horizontal=True)
+            if rtab == "Drop-offs by hub (last 30d)":
+                rows = query("""
+                    SELECT hub, SUM(COALESCE(shipped_count,0)) AS drops
+                    FROM messages
+                    WHERE msg_type='dropoff_report' AND date(timestamp) >= date('now','-30 days')
+                    GROUP BY hub
+                    ORDER BY drops DESC
+                """)
+                df = pd.DataFrame(rows, columns=["Hub","Drop-offs"])
+                st.dataframe(df, use_container_width=True, height=240)
             else:
-                st.caption("Drop-offs by hub")
-                st.dataframe(breakdown, use_container_width=True, height=260)
-                st.download_button("Export dropoffs_by_hub.csv", breakdown.to_csv(index=False).encode("utf-8"),
-                                   "dropoffs_by_hub.csv", "text/csv")
+                hubs = [h[0] for h in query("SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL ORDER BY hub")]
+                if not hubs:
+                    st.info("No hubs.")
+                else:
+                    sel = st.selectbox("Hub", hubs)
+                    rows = query("""
+                        SELECT sku, quantity FROM inventory
+                        WHERE hub=? AND quantity>0
+                        ORDER BY quantity DESC, sku
+                        LIMIT 5
+                    """, (sel,))
+                    df = pd.DataFrame(rows, columns=["SKU","Qty"])
+                    st.dataframe(df, use_container_width=True, height=240)
+        else:
+            st.subheader("My Hub Reports")
+            # Total drop-offs (last 30d) and Top 5 SKUs (on hand)
+            cols = st.columns(2)
+            with cols[0]:
+                st.markdown("**Drop-offs (last 30 days)**")
+                if not hub:
+                    st.info("No hub assigned.")
+                else:
+                    r = query("""
+                        SELECT SUM(COALESCE(shipped_count,0))
+                        FROM messages
+                        WHERE msg_type='dropoff_report' AND hub=? AND date(timestamp) >= date('now','-30 days')
+                    """, (hub,))
+                    total = int(r[0][0]) if r and r[0][0] is not None else 0
+                    st.metric("Orders dropped off", total)
+            with cols[1]:
+                st.markdown("**Top 5 SKUs (on hand)**")
+                if not hub:
+                    st.info("No hub assigned.")
+                else:
+                    rows = query("""
+                        SELECT sku, quantity FROM inventory
+                        WHERE hub=? AND quantity>0
+                        ORDER BY quantity DESC, sku
+                        LIMIT 5
+                    """, (hub,))
+                    df = pd.DataFrame(rows, columns=["SKU","Qty"])
+                    st.dataframe(df, use_container_width=True, height=220)
 
-            st.divider()
-            st.subheader("🏆 Top 5 SKUs (OUT)")
-            top5 = top5_out_skus(scope_hub, d1.isoformat(), d2.isoformat())
-            if top5.empty:
-                st.info("No OUT records in the period.")
-            else:
-                st.dataframe(top5, use_container_width=True, height=240)
-                st.download_button("Export top5_out.csv", top5.to_csv(index=False).encode("utf-8"),
-                                   "top5_out.csv", "text/csv")
-
-# ===== section 5: main UI, schemas, admin/hub/supplier pages ==================
+# ===== section 5: schemas, admin/hub/supplier pages ===========================
 def ensure_logs_schema():
-    query("""CREATE TABLE IF NOT EXISTS logs (
+    con = connect(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT,
         user TEXT,
@@ -602,7 +534,8 @@ def ensure_logs_schema():
         action TEXT,
         qty INTEGER,
         comment TEXT
-    )""", fetch=False, commit=True)
+    )""")
+    con.commit(); con.close()
 
 def ensure_shipments_schema():
     con = connect(); cur = con.cursor()
@@ -618,6 +551,7 @@ def ensure_shipments_schema():
         received_at TEXT,
         received_by TEXT
     )""")
+    # Add missing cols if legacy
     have = [r[1] for r in cur.execute("PRAGMA table_info(shipments)").fetchall()]
     for col, typ in {
         "supplier":"TEXT","tracking":"TEXT","carrier":"TEXT","hub":"TEXT","skus":"TEXT",
@@ -651,45 +585,17 @@ def create_indices():
 
 ensure_logs_schema()
 ensure_shipments_schema()
-ensure_settings_schema()
-create_indices()
-maybe_daily_auto_backup()
+create_indices()  # first attempt (guarded)
 
 # --- Home helpers (admin/hub) -------------------------------------------------
 ADMIN_LOW_STOCK = 5
 LOW_STOCK_THRESHOLD = 5
 
 def users_table():
-    st.subheader("👥 Users")
     rows = query("SELECT username, role, hub, disabled FROM users ORDER BY username")
     df = pd.DataFrame(rows, columns=["username","role","hub","disabled"])
-
-    fc = st.columns(4)
-    with fc[0]:
-        q = st.text_input("Search", placeholder="name contains…")
-    with fc[1]:
-        roles = sorted(df["role"].dropna().unique().tolist())
-        role_sel = st.multiselect("Role", roles)
-    with fc[2]:
-        hubs = sorted(df["hub"].dropna().unique().tolist())
-        hub_sel = st.multiselect("Hub", hubs)
-    with fc[3]:
-        show_disabled = st.selectbox("Disabled filter", ["All","Enabled only","Disabled only"], index=1)
-
-    fdf = df.copy()
-    if q:
-        fdf = fdf[fdf["username"].str.contains(q, case=False, na=False)]
-    if role_sel:
-        fdf = fdf[fdf["role"].isin(role_sel)]
-    if hub_sel:
-        fdf = fdf[fdf["hub"].isin(hub_sel)]
-    if show_disabled == "Enabled only":
-        fdf = fdf[fdf["disabled"] == 0]
-    elif show_disabled == "Disabled only":
-        fdf = fdf[fdf["disabled"] == 1]
-
-    st.dataframe(fdf, use_container_width=True, height=300)
-    st.download_button("Export users.csv", fdf.to_csv(index=False).encode("utf-8"), "users.csv", "text/csv")
+    st.subheader("👥 Users")
+    st.dataframe(df, use_container_width=True, height=300)
 
 def logs_table_filtered():
     st.subheader("🧾 Logs")
@@ -707,12 +613,14 @@ def logs_table_filtered():
     sql += " ORDER BY timestamp DESC LIMIT 5000"
     rows = query(sql, tuple(params))
     df = pd.DataFrame(rows, columns=["timestamp","user","action","comment","hub","sku","qty"])
+    if not df.empty:
+        df["timestamp"] = df["timestamp"].apply(fmt_ts_et)
     st.dataframe(df, use_container_width=True, height=380)
     st.download_button("Export logs.csv", df.to_csv(index=False).encode("utf-8"),
                        "logs.csv", "text/csv")
 
 def restore_csv_tool():
-    st.subheader("📥 Restore from CSV (safe)")
+    st.subheader("🛟 Restore from CSV (safe)")
     st.caption("Preview → Schema check → Requires confirmation → Makes a DB backup first.")
     tbl = st.selectbox("Target table", ["users","inventory","sku_info","shipments","logs","messages"])
     file = st.file_uploader("Choose CSV", type=["csv"], accept_multiple_files=False, key=f"up_{tbl}")
@@ -727,8 +635,10 @@ def restore_csv_tool():
     st.write("Preview (first 10 rows):")
     st.dataframe(df.head(10), use_container_width=True)
 
+    # Schema check
     try:
-        conn_v = connect(); cur_v = conn_v.cursor()
+        conn_v = connect()
+        cur_v = conn_v.cursor()
         pragma = cur_v.execute(f"PRAGMA table_info({tbl})").fetchall()
         table_cols = [r[1] for r in pragma]
         conn_v.close()
@@ -767,22 +677,25 @@ def restore_csv_tool():
             except Exception: pass
             st.error(f"Restore failed and was rolled back: {e}")
 
+def list_backups(limit: int = 50) -> List[Path]:
+    p = Path(DB).with_name(f"{Path(DB).stem}-*{Path(DB).suffix}")
+    return sorted(Path(DB).parent.glob(p.name), reverse=True)[:limit]
+
 # --- Admin Overview -----------------------------------------------------------
 def _admin_kpis() -> Dict[str, int]:
     tqty = query("SELECT COALESCE(SUM(quantity),0) FROM inventory")
     total_qty = int(tqty[0][0]) if tqty else 0
-    
+
     tsku = query("SELECT COUNT(DISTINCT sku) FROM inventory")
     total_skus = int(tsku[0][0]) if tsku else 0
-    
+
     hubs = query("SELECT COUNT(DISTINCT hub) FROM inventory WHERE hub IS NOT NULL")
     hubs_count = int(hubs[0][0]) if hubs else 0
-    
+
     low = query("SELECT COUNT(*) FROM (SELECT sku, hub FROM inventory WHERE quantity<=?)", (ADMIN_LOW_STOCK,))
     low_count = int(low[0][0]) if low else 0
 
     return dict(total_skus=total_skus, total_qty=total_qty, hubs=hubs_count, low=low_count)
-
 
 def _hubs_overview_df() -> pd.DataFrame:
     rows = query("""
@@ -832,8 +745,6 @@ def admin_home_page():
             st.info("No hub data yet.")
         else:
             st.dataframe(dfh, use_container_width=True, hide_index=True)
-            st.download_button("Export hubs_overview.csv", dfh.to_csv(index=False).encode("utf-8"),
-                               "hubs_overview.csv", "text/csv")
     with t2:
         dfl = _low_stock_all_df()
         if dfl.empty:
@@ -850,8 +761,6 @@ def admin_home_page():
         st.info("No shipments in the last 30 days.")
     else:
         st.dataframe(dfs, use_container_width=True, height=300)
-        st.download_button("Export shipments_30d.csv", dfs.to_csv(index=False).encode("utf-8"),
-                           "shipments_30d.csv", "text/csv")
 
     st.divider()
     st.subheader("👥 Users")
@@ -859,8 +768,21 @@ def admin_home_page():
 
 # --- Admin: Catalog helpers ---------------------------------------------------
 def _get_all_skus() -> List[Tuple[str, str]]:
+    """Return list of (sku, assigned_hubs_csv)."""
     rows = query("SELECT sku, COALESCE(assigned_hubs,'') FROM sku_info ORDER BY sku")
     return [(r[0], r[1]) for r in rows]
+
+def _hubs_list() -> List[str]:
+    rows = query("""
+        SELECT hub FROM (
+          SELECT DISTINCT hub FROM users WHERE hub IS NOT NULL
+          UNION
+          SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL
+        )
+        WHERE TRIM(hub) <> ''
+        ORDER BY hub
+    """)
+    return [r[0] for r in rows]
 
 def _merge_assignments(old_csv: str, to_add: List[str]) -> str:
     old = [h.strip() for h in (old_csv or "").split(",") if h and h.strip()]
@@ -868,11 +790,17 @@ def _merge_assignments(old_csv: str, to_add: List[str]) -> str:
     return ",".join(merged)
 
 def add_or_assign_sku_to_hubs(sku: str, hubs: List[str]):
+    """
+    - If SKU doesn't exist: create it in sku_info with product_name=sku and assigned_hubs = hubs CSV.
+    - If it exists: merge hubs into assigned_hubs.
+    - Ensure inventory rows exist (qty=0) for each selected hub.
+    """
     sku = (sku or "").strip()
     hubs = [h.strip() for h in hubs if h and h.strip()]
     if not sku or not hubs:
         return False, "SKU and hubs are required."
 
+    # Read existing
     rows = query("SELECT assigned_hubs FROM sku_info WHERE sku=?", (sku,))
     if rows:
         new_csv = _merge_assignments(rows[0][0], hubs)
@@ -882,10 +810,12 @@ def add_or_assign_sku_to_hubs(sku: str, hubs: List[str]):
         query("INSERT INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
               (sku, sku, ",".join(sorted(set(hubs)))), fetch=False, commit=True)
 
+    # Ensure inventory rows (0) for each hub
     for h in hubs:
         query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
               (sku, h, 0), fetch=False, commit=True)
 
+    # Best-effort log
     try:
         query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
               (_now_iso(), "admin", sku, None, "catalog_assign", None, f"hubs={hubs}"),
@@ -907,6 +837,7 @@ def admin_page(role: str):
     st.header("🛠️ Admin")
     tabs = st.tabs(["🏷️ Catalog", "💽 Backups", "📥 CSV Restore"])
 
+    # --- Catalog tab (add/assign SKUs to hubs) ---
     with tabs[0]:
         st.subheader("Catalog (Add / Assign SKUs)")
         hubs_known = _hubs_list()
@@ -924,10 +855,7 @@ def admin_page(role: str):
             hubs_sel_new = st.multiselect("Assign to hubs", hubs_all, placeholder="Pick one or more hubs")
             if st.button("Create & assign"):
                 ok, msg = add_or_assign_sku_to_hubs(new_sku, hubs_sel_new)
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
+                st.success(msg) if ok else st.error(msg)
 
         with colm[1]:
             st.markdown("**Assign existing SKU to more hubs**")
@@ -939,23 +867,14 @@ def admin_page(role: str):
             hubs_sel_more = st.multiselect("Add hubs", hubs_all, placeholder="Pick hubs to add")
             if st.button("Assign to hubs"):
                 ok, msg = add_or_assign_sku_to_hubs(sku_pick, hubs_sel_more)
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
+                st.success(msg) if ok else st.error(msg)
 
         st.divider()
-        st.caption("Note: Assigning an SKU to a hub creates a zero-qty row in **inventory**. Adjust quantities on the Inventory page.")
+        st.caption("Assigning an SKU to a hub creates a zero-qty row in **inventory**. Adjust quantities on the Inventory page.")
 
+    # --- Backups tab ---
     with tabs[1]:
         st.subheader("Back up & Restore SQLite DB")
-
-        auto_enabled = get_setting("auto_backup_enabled", "0") == "1"
-        new_toggle = st.checkbox("Enable daily auto-backup", value=auto_enabled)
-        if new_toggle != auto_enabled:
-            set_setting("auto_backup_enabled", "1" if new_toggle else "0")
-            st.success("Auto-backup setting updated.")
-
         col = st.columns(3)
         with col[0]:
             try:
@@ -984,10 +903,8 @@ def admin_page(role: str):
                 except Exception as e:
                     st.error(f"Restore failed: {e}")
                 finally:
-                    try:
-                        tmp_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    try: tmp_path.unlink(missing_ok=True)
+                    except Exception: pass
 
         st.markdown("### Recent backups")
         bks = list_backups()
@@ -1005,6 +922,7 @@ def admin_page(role: str):
                     except Exception as e:
                         st.error(f"Could not read backup {b.name}: {e}")
 
+    # --- CSV Restore tab ---
     with tabs[2]:
         restore_csv_tool()
 
@@ -1070,8 +988,6 @@ def hub_home_page(username: str, hub: Optional[str]):
         st.info("No recent shipments.")
     else:
         st.dataframe(sdf, use_container_width=True, height=260)
-        st.download_button("Export hub_shipments_90d.csv", sdf.to_csv(index=False).encode("utf-8"),
-                           "hub_shipments_90d.csv", "text/csv")
         open_rows = query("SELECT id, tracking, carrier, skus, status FROM shipments WHERE hub=? AND status IN ('Created','In Transit') ORDER BY id DESC", (hub,))
         if open_rows:
             st.caption("Open shipments (confirm to auto-IN inventory):")
@@ -1278,7 +1194,7 @@ def _confirm_receive_shipment(sid: int, hub: str, username: str) -> Tuple[bool,s
         current = int(r[0][0]) if r else 0
         new_qty = current + qty
         query("""
-            INSERT INTO inventory (sku, hub, quantity) VALUES (?, ?, ?)
+            INSERT INTO inventory (sku, hub, quantity) VALUES (?,?,?)
             ON CONFLICT(sku, hub) DO UPDATE SET quantity=excluded.quantity
         """, (sku_norm, hub, new_qty), fetch=False, commit=True)
         query("INSERT OR IGNORE INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
@@ -1381,26 +1297,6 @@ def _seed_all_skus():
             query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
                   (sku, h, 0), fetch=False, commit=True)
 
-def ensure_sku_inventory_schemas():
-    con = connect(); cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS sku_info (
-        sku TEXT PRIMARY KEY,
-        product_name TEXT,
-        assigned_hubs TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS inventory (
-        sku TEXT,
-        hub TEXT,
-        quantity INTEGER,
-        PRIMARY KEY (sku, hub)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS count_confirmations (
-        username TEXT,
-        hub TEXT,
-        confirmed_at TEXT
-    )""")
-    con.commit(); con.close()
-
 def seed_sku_inventory_if_empty():
     rows = query("SELECT COUNT(*) FROM sku_info")
     if rows and rows[0][0] == 0:
@@ -1408,7 +1304,7 @@ def seed_sku_inventory_if_empty():
 
 ensure_sku_inventory_schemas()
 seed_sku_inventory_if_empty()
-create_indices()
+create_indices()  # run again now that tables exist
 
 # ===== Section 7: Inventory (clean Hubs UI + list + IN/OUT + transfer + count)
 def _hub_stats() -> pd.DataFrame:
@@ -1420,26 +1316,6 @@ def _hub_stats() -> pd.DataFrame:
     """)
     return pd.DataFrame(rows, columns=["hub", "sku_count", "total_qty"])
 
-def _hubs_list() -> List[str]:
-    rows = query("""
-        SELECT hub FROM (
-          SELECT DISTINCT hub FROM users WHERE hub IS NOT NULL
-          UNION
-          SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL
-        )
-        WHERE TRIM(hub) <> ''
-        ORDER BY hub
-    """)
-    return [r[0] for r in rows]
-
-def _hub_options_for(role: str, user_hub: Optional[str]) -> List[str]:
-    hubs = _hubs_list()
-    if (role or "").lower() == "admin":
-        return (["All hubs"] + hubs) if hubs else ["All hubs"]
-    if user_hub and user_hub in hubs:
-        return [user_hub]
-    return hubs[:1] if hubs else []
-
 def _format_hub_option(opt: str, stats: Dict[str, Tuple[int, int]]) -> str:
     if opt == "All hubs":
         total_skus = sum(v[0] for v in stats.values()) if stats else 0
@@ -1449,6 +1325,14 @@ def _format_hub_option(opt: str, stats: Dict[str, Tuple[int, int]]) -> str:
         skus, qty = stats[opt]
         return f"{opt} — {skus} SKUs · {qty} pcs"
     return opt
+
+def _hub_options_for(role: str, user_hub: Optional[str]) -> List[str]:
+    hubs = _hubs_list()
+    if (role or "").lower() == "admin":
+        return (["All hubs"] + hubs) if hubs else ["All hubs"]
+    if user_hub and user_hub in hubs:
+        return [user_hub]
+    return hubs[:1] if hubs else []
 
 def render_hub_selector(username: str, role: str, user_hub: Optional[str]) -> Tuple[Optional[str], str]:
     stats_df = _hub_stats()
@@ -1483,10 +1367,8 @@ def render_hub_selector(username: str, role: str, user_hub: Optional[str]) -> Tu
         if stats_df.empty:
             st.info("No inventory yet.")
         else:
-            pretty = stats_df.rename(columns={"hub":"Hub","sku_count":"SKUs","total_qty":"On hand"})
-            st.dataframe(pretty, use_container_width=True, hide_index=True)
-            st.download_button("Export hub_overview.csv", pretty.to_csv(index=False).encode("utf-8"),
-                               "hub_overview.csv", "text/csv")
+            st.dataframe(stats_df.rename(columns={"hub":"Hub","sku_count":"SKUs","total_qty":"On hand"}),
+                         use_container_width=True, hide_index=True)
     return (selected_hub, raw)
 
 def _inventory_df_for(role: str, selected_hub: Optional[str]) -> pd.DataFrame:
@@ -1639,21 +1521,15 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
                 st.rerun()
 
 # --- Main app -----------------------------------------------------------------
-def _previous_login_iso(username: str) -> Optional[str]:
-    rows = query("SELECT timestamp FROM logs WHERE user=? AND action='login' ORDER BY timestamp DESC LIMIT 2", (username,))
-    if len(rows) == 2:
-        return rows[1][0]
-    return None
-
 def main():
     st.set_page_config(page_title="KISS Inventory", layout="wide")
-
-    # ET timestamp in sidebar (current)
-    st.sidebar.caption(_human_et(_now_dt_et()))
-
     st.title("KISS Inventory")
     st.caption("Keep It Simple Socks — Inventory & Ops")
 
+    # Show current ET time in sidebar (nice KISS touch)
+    st.sidebar.markdown(f"**{datetime.now(ET_TZ).strftime('%a, %b %d, %Y • %I:%M %p ET')}**")
+
+    # auth gate
     user = st.session_state.get("auth_user")
     if not user:
         login_form()
@@ -1662,17 +1538,15 @@ def main():
     username, role, hub = user
     coltop = st.columns([3,1])
     with coltop[0]:
-        welcome = f"Welcome, **{username}** ({role}{' — '+hub if hub else ''})"
-        st.success(welcome)
-        prev = _previous_login_iso(username)
-        if prev:
-            st.caption(f"Last sign-in: {format_iso_as_et_human(prev)}")
-        else:
-            st.caption("Last sign-in: first time or unknown.")
+        st.success(f"Welcome, **{username}** ({role}{' — '+hub if hub else ''})")
+        last = _last_login_for(username)
+        if last:
+            st.caption(f"Last sign-in: {fmt_ts_et(last)}")
     with coltop[1]:
         if st.button("Log out"):
             logout(); st.rerun()
 
+    # Sidebar nav based on role
     unread = unread_count(username)
     msgs_label = f"Messages 📬 ({unread})" if unread else "Messages 📬"
 
@@ -1693,6 +1567,7 @@ def main():
     if nav == "Admin" and is_admin(role):
         admin_page(role); st.stop()
 
+    # Homes
     if is_admin(role):
         admin_home_page()
     elif (role or "").lower() == "supplier":
@@ -1700,5 +1575,6 @@ def main():
     else:
         hub_home_page(username, hub)
 
+# Make sure this is at the very end of app.py, not inside any function
 if __name__ == "__main__":
     main()
