@@ -1,52 +1,68 @@
-# ===== app.py — KISS Inventory =====
+# ===== app.py — Tribe Inventory (KISS) =====
 import os
 from pathlib import Path
 import sqlite3
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Tuple
+import json
 
 import streamlit as st
 import pandas as pd
 
-try:
-    from zoneinfo import ZoneInfo  # py3.9+ backport
-except Exception:
-    ZoneInfo = None
+# --- Branding (KISS): change via env or here ---
+APP_NAME = os.getenv("APP_NAME", "Tribe Inventory")
+APP_TAGLINE = os.getenv("APP_TAGLINE", "Tribe — Inventory & Ops")
 
 # --- Config: DB path (env var or local file)
 DB = Path(os.getenv("TTT_DB_PATH", Path(__file__).parent / "ttt_inventory.db"))
-DB.parent.mkdir(parents=True, exist_ok=True)  # ensure folder exists
+DB.parent.mkdir(parents=True, exist_ok=True)  # make sure folder exists
 
-APP_VERSION = "v1.4.0-starter-pack-5"
+# Uploads root (for drop-off receipts)
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", DB.parent / "uploads"))
+DROP_DIR = UPLOADS_DIR / "dropoffs"
+DROP_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Time helpers -------------------------------------------------------------
-ET_TZ = ZoneInfo("America/New_York") if ZoneInfo else None
+# --- ET timezone helpers ------------------------------------------------------
+try:
+    from zoneinfo import ZoneInfo
+    ET_TZ = ZoneInfo("America/New_York")
+except Exception:
+    ET_TZ = None  # fallback if zoneinfo isn't available
 
-def fmt_ts_et(ts_str: Optional[str]) -> str:
-    """Format an ISO-ish timestamp string into ET 12-hour, e.g., 'Fri Sep 26, 2025 - 11:11 AM ET'."""
-    if not ts_str:
-        return "—"
-    try:
-        # Parse a few common shapes
-        s = ts_str.replace("Z", "")
-        if "." in s:
-            s = s.split(".")[0]
-        dt = datetime.fromisoformat(s)
-    except Exception:
-        try:
-            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return ts_str
-    # Assume naive = local server time; convert to ET
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+def et_now_dt() -> datetime:
     if ET_TZ:
-        dt = dt.astimezone(ET_TZ)
-    return dt.strftime("%a %b %d, %Y - %I:%M %p ET").lstrip("0").replace(" 0", " ")
+        return datetime.now(ET_TZ)
+    return datetime.now()
+
+def _now_iso() -> str:
+    """
+    Store timestamps in ET (or local if ET unavailable), ISO-like without 'T'.
+    Safe for SQLite date() ops.
+    """
+    return et_now_dt().strftime("%Y-%m-%d %H:%M:%S")
+
+def fmt_et(ts: str) -> str:
+    """
+    Render any stored timestamp string as ET 12-hour (KISS).
+    """
+    s = (ts or "").strip()
+    if not s:
+        return "—"
+    # try a few common shapes
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try:
+            dt = datetime.strptime(s.replace("T", " "), fmt.replace("T", " "))
+            # Treat as ET-naive; just display as 12h
+            return dt.strftime("%b %d, %Y %I:%M %p ET")
+        except Exception:
+            continue
+    # last resort: show incoming
+    return s
 
 # --- DB helpers ---------------------------------------------------------------
 def connect():
     con = sqlite3.connect(str(DB))
+    # Best-effort PRAGMAs (don’t crash if unsupported)
     try:
         con.execute("PRAGMA foreign_keys=ON")
         con.execute("PRAGMA journal_mode=WAL")
@@ -72,14 +88,11 @@ def execmany(sql: str, rows: List[Tuple]):
     con.commit()
     con.close()
 
-def _now_iso():
-    return datetime.now().isoformat(timespec="seconds")
-
 # --- Safety: backup the SQLite DB before destructive operations
 def backup_db() -> Optional[Path]:
     try:
         db_path = Path(DB)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        ts = et_now_dt().strftime("%Y%m%d-%I%M%S%p")
         backup = db_path.with_name(f"{db_path.stem}-{ts}{db_path.suffix}")
         import shutil
         shutil.copy2(db_path, backup)
@@ -100,6 +113,7 @@ def hash_password(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
 def verify_password(plain: str, stored: str) -> bool:
+    # bcrypt hash?
     if stored and stored.startswith("$2"):
         if not bcrypt:
             return False
@@ -107,6 +121,7 @@ def verify_password(plain: str, stored: str) -> bool:
             return bcrypt.checkpw(plain.encode(), stored.encode())
         except Exception:
             return False
+    # legacy sha256 (64 hex)
     import re, hashlib
     if re.fullmatch(r"[0-9a-f]{64}", stored or ""):
         return hashlib.sha256(plain.encode()).hexdigest() == stored
@@ -120,13 +135,14 @@ def ensure_users_schema_and_seed():
         role TEXT,
         hub TEXT
     )""")
-    # MIGRATION: add 'disabled' if missing
+    # MIGRATION: add 'disabled' column if missing
     cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "disabled" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN disabled INTEGER DEFAULT 0")
         cur.execute("UPDATE users SET disabled=0 WHERE disabled IS NULL")
-    # seed if empty
-    n = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    # Seed only if empty
+    cur.execute("SELECT COUNT(*) FROM users")
+    n = cur.fetchone()[0]
     if n == 0:
         seed = [
             ("kevin",   hash_password("adminpass"),  "Admin",       "HQ",    0),
@@ -164,11 +180,8 @@ def login(username: str, password: str):
                 pass
         try:
             ensure_logs_schema()
-            query(
-                "INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
-                (_now_iso(), uname, None, hub, "login", None, f"role={role}"),
-                fetch=False, commit=True
-            )
+            query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
+                  (_now_iso(), uname, None, hub, "login", None, f"role={role}"), fetch=False, commit=True)
         except Exception:
             pass
         return (uname, role, hub)
@@ -181,11 +194,9 @@ def logout():
 
 def last_login_for(username: str) -> Optional[str]:
     try:
-        row = query(
-            "SELECT timestamp FROM logs WHERE user=? AND action='login' ORDER BY id DESC LIMIT 1",
-            (username,)
-        )
-        return fmt_ts_et(row[0][0]) if row else None
+        r = query("SELECT timestamp FROM logs WHERE user=? AND action='login' ORDER BY timestamp DESC LIMIT 1",
+                  (username,))
+        return fmt_et(r[0][0]) if r else None
     except Exception:
         return None
 
@@ -222,6 +233,7 @@ def ensure_messages_schema():
         paid_count INTEGER,
         meta TEXT
     )""")
+    # Ensure columns exist
     have = [r[1] for r in cur.execute("PRAGMA table_info(messages)").fetchall()]
     required = {
         "recipient":"TEXT","subject":"TEXT","body":"TEXT",
@@ -243,9 +255,10 @@ def unread_count(username: str) -> int:
         return 0
 
 def _guard_message_send(sender: str, recipient: str) -> None:
-    s_role = (get_role(sender) or "").lower()
-    r_role = (get_role(recipient) or "").lower()
-    if s_role != "admin" and r_role != "admin":
+    s_role = get_role(sender) or ""
+    r_role = get_role(recipient) or ""
+    # Hubs/suppliers/etc can only message Admin (HQ). Admins can message anyone.
+    if (s_role or "").lower() != "admin" and (r_role or "").lower() != "admin":
         raise ValueError("Only Admins (HQ) can be messaged by non-admin users.")
 
 def send_message(sender: str, recipient: str, subject: str, body: str,
@@ -277,22 +290,31 @@ def mark_thread_read(username: str, thread_id: str):
     query("UPDATE messages SET read_at=? WHERE recipient=? AND thread_id=? AND read_at IS NULL",
           (_now_iso(), username, thread_id), fetch=False, commit=True)
 
-def get_inbox(username: str, only_unread: bool=False):
+def mark_thread_read_for_all_inbox_recipients(thread_id: str):
+    # Convenience for admin replies to mark all recipients' copies read
+    query("UPDATE messages SET read_at=? WHERE thread_id=? AND read_at IS NULL",
+          (_now_iso(), thread_id), fetch=False, commit=True)
+
+def get_inbox(username: str, only_unread: bool=False, filter_type: Optional[str]=None):
     ensure_messages_schema()
-    sql = "SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE recipient=?"
+    sql = "SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count,meta FROM messages WHERE recipient=?"
+    params: List = [username]
     if only_unread:
         sql += " AND read_at IS NULL"
+    if filter_type:
+        sql += " AND msg_type=?"
+        params.append(filter_type)
     sql += " ORDER BY timestamp DESC"
-    return query(sql, (username,))
+    return query(sql, tuple(params))
 
 def get_sent(username: str):
     ensure_messages_schema()
-    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE sender=? ORDER BY timestamp DESC",
+    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count,meta FROM messages WHERE sender=? ORDER BY timestamp DESC",
                  (username,))
 
 def get_thread(thread_id: str):
     ensure_messages_schema()
-    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
+    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count,meta FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
                  (thread_id,))
 
 def shipments_count_for(hub: str, start: str, end: str) -> int:
@@ -303,61 +325,146 @@ def shipments_count_for(hub: str, start: str, end: str) -> int:
     except Exception:
         return 0
 
+# --- Weekly helpers (Mon–Sun) -------------------------------------------------
+def _week_bounds(d: date) -> Tuple[date, date]:
+    """Return (monday, sunday) for the week containing date d."""
+    monday = d - timedelta(days=d.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+def _weekly_thread_id(hub: str, week_start: date) -> str:
+    """Deterministic thread ID so all weekly messages for that hub+week stay together."""
+    return f"weekly:{hub}:{week_start.isoformat()}"
+
+def _hub_dropoffs_by_day(hub: str, start: date, end: date) -> List[Tuple[str, int]]:
+    """[(YYYY-MM-DD, count), ...] for that hub and date range based on dropoff_report messages."""
+    rows = query("""
+        SELECT shipped_range_start AS day, COALESCE(SUM(shipped_count),0) AS cnt
+        FROM messages
+        WHERE msg_type='dropoff_report'
+          AND hub=?
+          AND date(shipped_range_start) BETWEEN date(?) AND date(?)
+        GROUP BY shipped_range_start
+        ORDER BY shipped_range_start
+    """, (hub, start.isoformat(), end.isoformat()))
+    return [(r[0], int(r[1])) for r in rows]
+
+def _weekly_lines(hub: str, week_start: date) -> Tuple[List[Tuple[str,int]], int, date]:
+    """Return ([(YYYY-MM-DD, count)..7 days], total, week_end)."""
+    week_end = week_start + timedelta(days=6)
+    by_day = dict(_hub_dropoffs_by_day(hub, week_start, week_end))
+    days: List[Tuple[str,int]] = []
+    total = 0
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        cnt = int(by_day.get(d.isoformat(), 0))
+        days.append((d.isoformat(), cnt))
+        total += cnt
+    return days, total, week_end
+
+def _weekly_subject(hub: str, ws: date, we: date, total: int) -> str:
+    return f"[WEEKLY] {hub} drop-offs {ws.isoformat()} → {we.isoformat()} — {total} orders"
+
+def _weekly_default_body(hub: str, ws: date, we: date, days: List[Tuple[str,int]], total: int) -> str:
+    lines = [f"{hub} — Weekly drop-offs (Mon–Sun)",
+             f"Week: {ws.isoformat()} → {we.isoformat()}",
+             "--------------------------------"]
+    # Label the days for readability
+    day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    for (i, (ds, cnt)) in enumerate(days):
+        lines.append(f"{day_names[i]} {ds}: {cnt}")
+    lines += ["--------------------------------", f"Total: {total}", "", "Notes: "]
+    return "\n".join(lines)
+
+def _weekly_thread_history(hub: str, ws: date) -> List[Tuple]:
+    """All messages in the weekly thread (any sender/recipient)."""
+    tid = _weekly_thread_id(hub, ws)
+    return get_thread(tid) or []
+
+def _latest_weekly_body_or_default(hub: str, ws: date, we: date) -> Tuple[str, str, int, List[Tuple[str,int]]]:
+    """Prefill editor with latest body from the thread, else default draft."""
+    days, total, _we = _weekly_lines(hub, ws)
+    history = _weekly_thread_history(hub, ws)
+    if history:
+        # Use the last message body in the thread as starting point
+        last_body = history[-1][5] or ""
+        last_subj = history[-1][4] or _weekly_subject(hub, ws, we, total)
+        return last_subj, last_body, total, days
+    # No history: make a clean draft
+    subj = _weekly_subject(hub, ws, we, total)
+    body = _weekly_default_body(hub, ws, we, days, total)
+    return subj, body, total, days
+
 # ===== section 4: messaging UI page ==========================================
 def messaging_page(current_user: str, role: str, hub: Optional[str]):
     st.header("💬 Messages")
+
     top = st.columns([3,1])
     with top[0]:
-        st.caption(f"Logged in as **{current_user}** ({role}{' — '+hub if hub else ''})")
         last = last_login_for(current_user)
+        subtitle = f"Logged in as **{current_user}** ({role}{' — '+hub if hub else ''})"
         if last:
-            st.caption(f"Last sign-in: {last}")
+            subtitle += f" · Last sign-in: {last}"
+        st.caption(subtitle)
     with top[1]:
         st.metric("Unread", unread_count(current_user))
 
     is_admin_user = is_admin(role)
 
-    # Tabs: Admin gets Inbox/Sent/Compose/Drop-offs/Reports; others get Inbox/Compose/Drop-offs/Reports
     if is_admin_user:
-        tabs = st.tabs(["📥 Inbox","📤 Sent","✍️ Compose","📮 Drop-offs","📊 Reports"])
+        tabs = st.tabs(["📥 Inbox","📤 Sent","✍️ Compose"])
     else:
-        tabs = st.tabs(["📥 Inbox","📨 Message HQ","📮 Drop-offs","📊 Reports"])
+        tabs = st.tabs(["📥 Inbox","📨 Message HQ"])
 
     # --- inbox ---
     with tabs[0]:
-        c = st.columns([1,2])
-        if c[0].button("Mark all read"):
-            inbox_all = get_inbox(current_user, only_unread=True)
-            tids = {r[6] for r in inbox_all}
-            for tid in tids:
-                mark_thread_read(current_user, tid)
-            st.rerun()
-        show_unread = c[1].checkbox("Show only unread", value=False)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        only_unread = c1.checkbox("Unread only", value=False)
+        f_all = c2.button("All")
+        f_paid = c3.button("Paid")
+        f_ship = c4.button("Shipped")
+        f_drop = c5.button("Drop-offs")
+        f_week = c6.button("Weekly")
+        ftype = None
+        if f_paid: ftype = "paid_notice"
+        elif f_ship: ftype = "shipped_report"
+        elif f_drop: ftype = "dropoff_report"
+        elif f_week: ftype = "weekly_dropoffs"
 
-        inbox = get_inbox(current_user, only_unread=show_unread)
+        inbox = get_inbox(current_user, only_unread=only_unread, filter_type=ftype)
         if not inbox:
             st.info("No messages.")
         else:
             threads: Dict[str, list] = {}
             for r in inbox:
                 threads.setdefault(r[6], []).append(r)
-            for tid, items in list(threads.items())[:200]:
+            for tid, items in list(threads.items())[:100]:
                 latest = items[0]
                 unread = any(it[8] is None and it[3]==current_user for it in items)
-                label = f"{'🔵 ' if unread else ''}{latest[2]} • {latest[4]} • {fmt_ts_et(latest[1])}"
+                label = f"{'🔵 ' if unread else ''}{latest[2]} • {latest[4]} • {fmt_et(latest[1])}"
                 with st.expander(label, expanded=False):
                     for it in items[::-1]:
-                        _id, ts, snd, rcp, sub, body, _t, mtype, r_at, _hub, scnt, rs, re_, pcnt = it
+                        _id, ts, snd, rcp, sub, body, _t, mtype, r_at, _hub, scnt, rs, re_, pcnt, meta = it
                         badge = "✉️"
                         if mtype=="shipped_report": badge="🟣 Shipped"
                         elif mtype=="paid_notice": badge="🟢 Paid"
                         elif mtype=="dropoff_report": badge="🟠 Drop-off"
-                        st.markdown(f"**{snd} → {rcp}** · _{fmt_ts_et(ts)}_ · {badge}")
+                        elif mtype=="weekly_dropoffs": badge="🟧 Weekly"
+                        st.markdown(f"**{snd} → {rcp}** · _{fmt_et(ts)}_ · {badge}")
                         st.write(body)
-                        if scnt is not None and (mtype in ("shipped_report","dropoff_report")):
+                        if mtype in ("shipped_report","dropoff_report","weekly_dropoffs") and scnt is not None:
                             if rs and re_:
                                 st.caption(f"Count: {scnt} ({rs} → {re_})")
                         if pcnt is not None: st.caption(f"Paid: {pcnt}")
+                        # show receipt preview if present (dropoff)
+                        if mtype=="dropoff_report" and meta:
+                            try:
+                                md = json.loads(meta)
+                                rp = md.get("receipt_path")
+                                if rp and Path(rp).exists():
+                                    st.image(rp, caption="Receipt", use_column_width=True)
+                            except Exception:
+                                pass
                         st.divider()
                     cols = st.columns([1,2,2])
                     if cols[0].button("Mark read", key=f"mr_{tid}"):
@@ -367,22 +474,11 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                         to = latest[2] if latest[2]!=current_user else latest[3]
                         try:
                             send_message(current_user, to, subject=latest[4], body=reply, msg_type="message", thread_id=tid, hub=hub)
-                            # Auto-mark read on reply
+                            # Auto-mark as read on reply
                             mark_thread_read(current_user, tid)
                             st.success("Reply sent."); st.rerun()
                         except ValueError as e:
                             st.error(str(e))
-                    if is_admin_user:
-                        paid = cols[2].number_input("Paid count", min_value=0, step=1, key=f"pc_{tid}")
-                        if cols[2].button("Send paid notice", key=f"p_{tid}"):
-                            to = latest[2] if latest[2]!=current_user else latest[3]
-                            try:
-                                send_message(current_user, to, subject=f"[PAID] {latest[4]}", body=f"Paid for {int(paid)} orders.",
-                                             msg_type="paid_notice", thread_id=tid, hub=hub, paid_count=int(paid))
-                                mark_thread_read(current_user, tid)
-                                st.success("Paid notice sent."); st.rerun()
-                            except ValueError as e:
-                                st.error(str(e))
 
     # --- sent (admins only) ---
     if is_admin_user:
@@ -391,12 +487,9 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
             if not sent:
                 st.info("No sent messages.")
             else:
-                df = pd.DataFrame(
-                    sent,
-                    columns=["id","timestamp","sender","recipient","subject","body","thread_id","msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count"]
-                )
+                df = pd.DataFrame(sent, columns=["id","timestamp","sender","recipient","subject","body","thread_id","msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count","meta"])
                 if not df.empty:
-                    df["timestamp"] = df["timestamp"].map(fmt_ts_et)
+                    df["timestamp"] = df["timestamp"].apply(fmt_et)
                 st.dataframe(df, use_container_width=True, height=400)
 
     # --- compose / message HQ ---
@@ -424,7 +517,8 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
 
         subject = st.text_input("Subject")
         body = st.text_area("Message")
-        if st.button("Send message"):
+        send_disabled = (not subject.strip()) or (not body.strip()) or (not recips)
+        if st.button("Send message", disabled=send_disabled):
             if not recips:
                 st.warning("No recipients.")
             else:
@@ -439,99 +533,6 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                     st.success(f"Sent to {ok} user(s).")
                 if err:
                     st.error(f"{err} message(s) blocked by policy.")
-
-    # --- Drop-offs tab (simple) ---
-    with tabs[3 if is_admin_user else 2]:
-        if is_admin_user:
-            st.info("Drop-off reports/receipts are submitted by hubs. Review receipts under Admin → Receipts.")
-        else:
-            import datetime as dt
-            st.subheader("📮 Post Office Drop-off")
-            rs = st.date_input("Date", value=dt.date.today(), key="dropoff_date")
-            drop = st.number_input("Orders dropped off", min_value=0, step=1, key="dropoff_cnt")
-            note = st.text_input("Note (optional)", key="dropoff_note")
-            # Optional receipt upload (photo)
-            rec = st.file_uploader("Upload receipt photo (optional)", type=["jpg","jpeg","png"], accept_multiple_files=False)
-            rec_path_text = None
-            if st.button("Send drop-off report"):
-                if not hub:
-                    st.warning("Your user has no hub assigned.")
-                else:
-                    # Save upload if provided
-                    if rec is not None:
-                        p = _dropoff_dir() / f"{current_user}_{hub}_{datetime.now().strftime('%Y%m%d-%I%M%S%p')}.jpg"
-                        p.write_bytes(rec.getbuffer())
-                        rec_path_text = str(p)
-                    admins = [u[0] for u in query("SELECT username, role FROM users WHERE LOWER(role)='admin'")]
-                    subj = f"[DROPOFF] {hub} {rs.isoformat()} — {int(drop)} orders"
-                    body = (note or f"{hub}: dropped off {int(drop)} orders on {rs.isoformat()}")
-                    if rec_path_text:
-                        body += f"\nReceipt: {rec_path_text}"
-                    for adm in admins:
-                        try:
-                            send_message(current_user, adm, subject=subj, body=body,
-                                         msg_type="dropoff_report", hub=hub, shipped_count=int(drop),
-                                         range_start=rs.isoformat(), range_end=rs.isoformat())
-                        except ValueError:
-                            pass
-                    st.success(f"Reported {int(drop)} orders dropped off.")
-
-    # --- Reports tab (KISS) ---
-    with tabs[-1]:
-        if is_admin_user:
-            st.subheader("Admin reports")
-            days = st.slider("Lookback days", min_value=7, max_value=180, value=30, step=1)
-            # Top 5 SKUs across all hubs
-            rows = query("""
-                SELECT sku, SUM(quantity) as total
-                FROM inventory
-                GROUP BY sku
-                ORDER BY total DESC
-                LIMIT 5
-            """)
-            df = pd.DataFrame(rows, columns=["SKU","Qty"])
-            st.markdown("**Top 5 SKUs (by on-hand)**")
-            if df.empty: st.info("No data"); 
-            else: st.dataframe(df, use_container_width=True, height=200)
-
-            # Drop-offs count by hub (messages of type dropoff_report)
-            rows = query("""
-                SELECT hub, COALESCE(SUM(shipped_count),0) as dropoffs
-                FROM messages
-                WHERE msg_type='dropoff_report' AND date(timestamp) >= date('now', ?)
-                GROUP BY hub
-                ORDER BY dropoffs DESC
-            """, (f"-{days} days",))
-            df2 = pd.DataFrame(rows, columns=["Hub","Drop-offs"])
-            st.markdown("**Drop-offs (last {} days)**".format(days))
-            if df2.empty: st.info("No data"); 
-            else: st.dataframe(df2, use_container_width=True, height=220)
-        else:
-            st.subheader("Hub reports")
-            if not hub:
-                st.info("Your user has no hub assigned.")
-            else:
-                # Top 5 SKUs at my hub
-                rows = query("""
-                    SELECT sku, quantity
-                    FROM inventory
-                    WHERE hub=?
-                    ORDER BY quantity DESC
-                    LIMIT 5
-                """, (hub,))
-                df = pd.DataFrame(rows, columns=["SKU","Qty"])
-                st.markdown("**Top 5 SKUs (by on-hand)**")
-                if df.empty: st.info("No data"); 
-                else: st.dataframe(df, use_container_width=True, height=200)
-
-                # My drop-offs total
-                rows = query("""
-                    SELECT COALESCE(SUM(shipped_count),0)
-                    FROM messages
-                    WHERE msg_type='dropoff_report' AND hub=?
-                """, (hub,))
-                total = int(rows[0][0]) if rows else 0
-                st.metric("Total drop-offs (all time)", total)
 
 # ===== section 5: main UI, schemas, admin/hub/supplier pages ==================
 def ensure_logs_schema():
@@ -562,6 +563,7 @@ def ensure_shipments_schema():
         received_at TEXT,
         received_by TEXT
     )""")
+    # Add missing cols if legacy
     have = [r[1] for r in cur.execute("PRAGMA table_info(shipments)").fetchall()]
     for col, typ in {
         "supplier":"TEXT","tracking":"TEXT","carrier":"TEXT","hub":"TEXT","skus":"TEXT",
@@ -585,6 +587,8 @@ def create_indices():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_hub_qty ON inventory(hub, quantity)")
         if _table_exists("messages"):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(msg_type)")
         if _table_exists("logs"):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp)")
         if _table_exists("shipments"):
@@ -604,6 +608,7 @@ LOW_STOCK_THRESHOLD = 5
 def users_table():
     rows = query("SELECT username, role, hub, disabled FROM users ORDER BY username")
     df = pd.DataFrame(rows, columns=["username","role","hub","disabled"])
+    st.subheader("👥 Users")
     st.dataframe(df, use_container_width=True, height=300)
 
 def logs_table_filtered():
@@ -623,7 +628,7 @@ def logs_table_filtered():
     rows = query(sql, tuple(params))
     df = pd.DataFrame(rows, columns=["timestamp","user","action","comment","hub","sku","qty"])
     if not df.empty:
-        df["timestamp"] = df["timestamp"].map(fmt_ts_et)
+        df["timestamp"] = df["timestamp"].apply(fmt_et)
     st.dataframe(df, use_container_width=True, height=380)
     st.download_button("Export logs.csv", df.to_csv(index=False).encode("utf-8"),
                        "logs.csv", "text/csv")
@@ -646,7 +651,8 @@ def restore_csv_tool():
 
     # Schema check
     try:
-        conn_v = connect(); cur_v = conn_v.cursor()
+        conn_v = connect()
+        cur_v = conn_v.cursor()
         pragma = cur_v.execute(f"PRAGMA table_info({tbl})").fetchall()
         table_cols = [r[1] for r in pragma]
         conn_v.close()
@@ -730,7 +736,24 @@ def _shipments_overview_df(days: int = 30) -> pd.DataFrame:
         WHERE date(date) >= date('now', ?)
         ORDER BY date(date) DESC, hub
     """, (f"-{days} days",))
-    return pd.DataFrame(rows, columns=["Hub","Date","Supplier","Tracking","Carrier","Status"])
+    df = pd.DataFrame(rows, columns=["Hub","Date","Supplier","Tracking","Carrier","Status"])
+    if not df.empty:
+        df["Date"] = df["Date"].apply(fmt_et)
+    return df
+
+def _admin_dropoffs_summary(start: date, end: date, hub: Optional[str]) -> int:
+    sql = """
+      SELECT COALESCE(SUM(shipped_count),0)
+      FROM messages
+      WHERE msg_type='dropoff_report'
+        AND date(shipped_range_start) BETWEEN date(?) AND date(?)
+    """
+    params: List = [start.isoformat(), end.isoformat()]
+    if hub and hub.strip():
+        sql += " AND hub=?"
+        params.append(hub)
+    r = query(sql, tuple(params))
+    return int(r[0][0]) if r else 0
 
 def admin_home_page():
     st.subheader("Admin Overview")
@@ -746,14 +769,14 @@ def admin_home_page():
 
     with t1:
         dfh = _hubs_overview_df()
-        if dfh is None or dfh.empty:
-            st.info("No hub data yet.")
-        else:
+        if not dfh.empty:
             st.dataframe(dfh, use_container_width=True, hide_index=True)
+        else:
+            st.info("No hub data yet.")
 
     with t2:
         dfl = _low_stock_all_df()
-        if dfl is None or dfl.empty:
+        if dfl.empty:
             st.success("No low-stock items across hubs.")
         else:
             st.dataframe(dfl, use_container_width=True, height=320)
@@ -761,13 +784,13 @@ def admin_home_page():
                 "Export low_stock_all.csv",
                 dfl.to_csv(index=False).encode("utf-8"),
                 "low_stock_all.csv",
-                "text/csv",
+                "text/csv"
             )
 
     st.divider()
     st.subheader("📦 Shipments (last 30 days)")
     dfs = _shipments_overview_df(30)
-    if dfs is None or dfs.empty:
+    if dfs.empty:
         st.info("No shipments in the last 30 days.")
     else:
         st.dataframe(dfs, use_container_width=True, height=300)
@@ -785,8 +808,10 @@ def admin_home_page():
             query("UPDATE users SET disabled=? WHERE username=?", (0 if dis else 1, uname), fetch=False, commit=True)
             st.rerun()
 
-# --- Admin: Catalog helpers + Receipts ---------------------------------------
+
+# --- Admin: Catalog helpers ---------------------------------------------------
 def _get_all_skus() -> List[Tuple[str, str]]:
+    """Return list of (sku, assigned_hubs_csv)."""
     rows = query("SELECT sku, COALESCE(assigned_hubs,'') FROM sku_info ORDER BY sku")
     return [(r[0], r[1]) for r in rows]
 
@@ -796,10 +821,17 @@ def _merge_assignments(old_csv: str, to_add: List[str]) -> str:
     return ",".join(merged)
 
 def add_or_assign_sku_to_hubs(sku: str, hubs: List[str]):
+    """
+    - If SKU doesn't exist: create it in sku_info with product_name=sku and assigned_hubs = hubs CSV.
+    - If it exists: merge hubs into assigned_hubs.
+    - Ensure inventory rows exist (qty=0) for each selected hub.
+    """
     sku = (sku or "").strip()
     hubs = [h.strip() for h in hubs if h and h.strip()]
     if not sku or not hubs:
         return False, "SKU and hubs are required."
+
+    # Read existing
     rows = query("SELECT assigned_hubs FROM sku_info WHERE sku=?", (sku,))
     if rows:
         new_csv = _merge_assignments(rows[0][0], hubs)
@@ -808,37 +840,103 @@ def add_or_assign_sku_to_hubs(sku: str, hubs: List[str]):
     else:
         query("INSERT INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
               (sku, sku, ",".join(sorted(set(hubs)))), fetch=False, commit=True)
+
+    # Ensure inventory rows (0) for each hub
     for h in hubs:
         query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
               (sku, h, 0), fetch=False, commit=True)
+
+    # Best-effort log
     try:
         query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
               (_now_iso(), "admin", sku, None, "catalog_assign", None, f"hubs={hubs}"),
               fetch=False, commit=True)
     except Exception:
         pass
+
     return True, f"SKU '{sku}' assigned to: {', '.join(hubs)}"
 
-# Receipts helpers/viewer
-def _dropoff_dir() -> Path:
-    base = Path(__file__).parent
-    d = base / "data" / "uploads" / "dropoffs"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _admin_receipts_viewer():
+    st.subheader("📸 Drop-off Receipts")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start = st.date_input("From", value=date.today()-timedelta(days=30))
+    with c2:
+        end = st.date_input("To", value=date.today())
+    with c3:
+        hubs = [r[0] for r in query("SELECT DISTINCT hub FROM users WHERE hub IS NOT NULL ORDER BY hub")]
+        hub_sel = st.selectbox("Hub (optional)", ["All"] + hubs)
+        hub_filter = None if hub_sel == "All" else hub_sel
 
-def _display_receipt(path_str: str):
-    p = Path(path_str)
-    if not p.is_file():
-        p = Path(__file__).parent / path_str.lstrip("/")
-    if not p.is_file():
-        st.error(f"Not found: {path_str}")
+    # Query dropoff messages
+    sql = """
+      SELECT id, timestamp, sender, hub, shipped_count, shipped_range_start, meta
+      FROM messages
+      WHERE msg_type='dropoff_report'
+        AND date(shipped_range_start) BETWEEN date(?) AND date(?)
+    """
+    params: List = [start.isoformat(), end.isoformat()]
+    if hub_filter:
+        sql += " AND hub=?"
+        params.append(hub_filter)
+    sql += " ORDER BY timestamp DESC LIMIT 500"
+    rows = query(sql, tuple(params))
+
+    if not rows:
+        st.info("No receipts in that range.")
         return
-    st.image(str(p), caption=p.name, use_container_width=True)
-    try:
-        with open(p, "rb") as f:
-            st.download_button("Download image", f.read(), file_name=p.name, mime="image/jpeg", key=f"dl_{p.name}")
-    except Exception as e:
-        st.error(f"Could not read {p.name}: {e}")
+
+    for mid, ts, sender, mhub, cnt, rs, meta in rows:
+        st.markdown(f"**{mhub}** · {fmt_et(ts)} · {sender} · drop-offs: {cnt} · date: {rs}")
+        rp = None
+        if meta:
+            try:
+                md = json.loads(meta)
+                rp = md.get("receipt_path")
+            except Exception:
+                pass
+        if rp and Path(rp).exists():
+            st.image(rp, use_column_width=True)
+        else:
+            st.caption("No receipt image found.")
+        st.divider()
+
+def _admin_reports_tab():
+    st.subheader("🧮 Reports (KISS)")
+    hubs = [r[0] for r in query("SELECT DISTINCT hub FROM inventory WHERE hub IS NOT NULL ORDER BY hub")]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start = st.date_input("From", value=date.today()-timedelta(days=30), key="adm_r_from")
+    with c2:
+        end = st.date_input("To", value=date.today(), key="adm_r_to")
+    with c3:
+        hub_sel = st.selectbox("Hub scope", ["All"] + hubs, key="adm_r_hsel")
+
+    st.markdown("**Post Office Drop-offs (sum)**")
+    s = _admin_dropoffs_summary(start, end, None if hub_sel=="All" else hub_sel)
+    st.metric("Total drop-offs", s)
+
+    st.divider()
+    st.markdown("**Top 5 SKUs by on-hand**")
+    if hub_sel=="All":
+        rows = query("""
+            SELECT sku, SUM(quantity) AS qty
+            FROM inventory
+            GROUP BY sku
+            ORDER BY qty DESC, sku
+            LIMIT 5
+        """)
+    else:
+        rows = query("""
+            SELECT sku, quantity
+            FROM inventory
+            WHERE hub=?
+            ORDER BY quantity DESC, sku
+            LIMIT 5
+        """, (hub_sel,))
+    df = pd.DataFrame(rows, columns=["SKU","Qty"])
+    st.dataframe(df, use_container_width=True, height=220)
+    st.download_button("Export top5.csv", df.to_csv(index=False).encode("utf-8"), "top5.csv", "text/csv")
 
 def admin_logs_page(role: str):
     if not is_admin(role):
@@ -850,9 +948,9 @@ def admin_page(role: str):
     if not is_admin(role):
         st.error("Unauthorized."); return
     st.header("🛠️ Admin")
-    tabs = st.tabs(["🏷️ Catalog", "💽 Backups", "📥 CSV Restore", "🧾 Receipts"])
+    tabs = st.tabs(["🏷️ Catalog", "📸 Receipts", "📊 Reports", "💽 Backups", "📥 CSV Restore"])
 
-    # --- Catalog tab ---
+    # --- Catalog tab (add/assign SKUs to hubs) ---
     with tabs[0]:
         st.subheader("Catalog (Add / Assign SKUs)")
         hubs_known = _hubs_list()
@@ -887,8 +985,16 @@ def admin_page(role: str):
         st.divider()
         st.caption("Note: Assigning an SKU to a hub creates a zero-qty row in **inventory**. Adjust quantities on the Inventory page.")
 
-    # --- Backups tab ---
+    # --- Receipts viewer ---
     with tabs[1]:
+        _admin_receipts_viewer()
+
+    # --- Reports ---
+    with tabs[2]:
+        _admin_reports_tab()
+
+    # --- Backups tab ---
+    with tabs[3]:
         st.subheader("Back up & Restore SQLite DB")
         col = st.columns(3)
         with col[0]:
@@ -940,44 +1046,10 @@ def admin_page(role: str):
                         st.error(f"Could not read backup {b.name}: {e}")
 
     # --- CSV Restore tab ---
-    with tabs[2]:
+    with tabs[4]:
         restore_csv_tool()
 
-    # --- Receipts tab ---
-    with tabs[3]:
-        st.subheader("Drop-off Receipts")
-        receipt_dir = _dropoff_dir()
-        files = sorted(receipt_dir.glob("*.jpg")) + sorted(receipt_dir.glob("*.png")) + sorted(receipt_dir.glob("*.jpeg"))
-        if not files:
-            st.info("No receipts found yet.")
-        else:
-            cols = st.columns([2,2,2])
-            f_text = cols[0].text_input("Filter by file name", "")
-            f_hub  = cols[1].text_input("Filter by hub (e.g., Hub 3)", "")
-            f_user = cols[2].text_input("Filter by user (e.g., carmen)", "")
-
-            def _match(p: Path) -> bool:
-                name = p.name
-                if f_text and f_text.lower() not in name.lower():
-                    return False
-                parts = name.rsplit(".", 1)[0].split("_")
-                user = parts[0] if parts else ""
-                hub  = "_".join(parts[1:-1]) if len(parts) >= 3 else ""
-                if f_hub and f_hub.lower() not in hub.lower():
-                    return False
-                if f_user and f_user.lower() not in user.lower():
-                    return False
-                return True
-
-            shown = [p for p in files if _match(p)]
-            if not shown:
-                st.warning("No receipts match your filters.")
-            else:
-                for p in shown[:200]:
-                    with st.expander(p.name, expanded=False):
-                        _display_receipt(str(p))
-
-# --- Hub Home (dashboard) -----------------------------------------------------
+# --- Hub Home (dashboard + drop-offs + reports) -------------------------------
 def _hub_kpis(hub: str) -> Dict[str, int]:
     tq = query("SELECT COALESCE(SUM(quantity),0) FROM inventory WHERE hub=?", (hub,))
     total_qty = int(tq[0][0]) if tq else 0
@@ -1009,53 +1081,263 @@ def _recent_shipments_df(hub: str, days: int = 90) -> pd.DataFrame:
         WHERE hub=? AND date(date) >= date('now', ?)
         ORDER BY date(date) DESC
         """, (hub, f"-{days} days"))
-    return pd.DataFrame(rows, columns=["ID","Date","Supplier","Tracking","Carrier","Status"])
+    df = pd.DataFrame(rows, columns=["ID","Date","Supplier","Tracking","Carrier","Status"])
+    if not df.empty:
+        df["Date"] = df["Date"].apply(fmt_et)
+    return df
+
+def _hub_dropoffs_sum(hub: str, start: date, end: date) -> int:
+    r = query("""
+        SELECT COALESCE(SUM(shipped_count),0)
+        FROM messages
+        WHERE msg_type='dropoff_report' AND hub=? AND date(shipped_range_start) BETWEEN date(?) AND date(?)
+    """, (hub, start.isoformat(), end.isoformat()))
+    return int(r[0][0]) if r else 0
+
+def _hub_top5_df(hub: str) -> pd.DataFrame:
+    rows = query("""
+        SELECT sku, quantity
+        FROM inventory
+        WHERE hub=?
+        ORDER BY quantity DESC, sku
+        LIMIT 5
+    """, (hub,))
+    return pd.DataFrame(rows, columns=["SKU","Qty"])
+
+def _save_receipt_file(username: str, hub: str, file) -> Optional[str]:
+    try:
+        ts = et_now_dt().strftime("%Y%m%d-%I%M%S%p")
+        safe_hub = hub.replace("/", "_")
+        name = f"{username}_{safe_hub}_{ts}"
+        suffix = Path(file.name).suffix.lower() if hasattr(file, "name") else ".jpg"
+        if suffix not in (".jpg",".jpeg",".png",".pdf",".gif",".webp"):
+            suffix = ".jpg"
+        path = DROP_DIR / f"{name}{suffix}"
+        path.write_bytes(file.getbuffer())
+        return str(path)
+    except Exception:
+        return None
+
+def _hub_weekly_tab(username: str, hub: str):
+    st.subheader("💵 Weekly Drop-offs (Mon–Sun)")
+
+    # Persist a week anchor in session_state so prev/next survives reruns
+    anchor_key = f"wk_anchor_{hub}"
+    if anchor_key not in st.session_state:
+        st.session_state[anchor_key] = date.today()
+
+    picked = st.date_input(
+        "Pick a date (we’ll use its Mon–Sun week)",
+        value=st.session_state[anchor_key],
+        key=f"wk_pick_{hub}"
+    )
+    # If user changed the date_input, update anchor
+    if picked != st.session_state[anchor_key]:
+        st.session_state[anchor_key] = picked
+
+    ws, we = _week_bounds(st.session_state[anchor_key])
+
+    cnav = st.columns([1,1,4])
+    if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
+        st.session_state[anchor_key] = st.session_state[anchor_key] - timedelta(days=7)
+        st.rerun()
+    if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
+        st.session_state[anchor_key] = st.session_state[anchor_key] + timedelta(days=7)
+        st.rerun()
+    # Recompute after possible change
+    ws, we = _week_bounds(st.session_state[anchor_key])
+    cnav[2].caption(f"Week window: **{ws.isoformat()} → {we.isoformat()}**")
+
+    # Suggest subject/body (reuse last sent in thread if any)
+    subj, body, total, days = _latest_weekly_body_or_default(hub, ws, we)
+
+    subj = st.text_input("Subject", value=subj, key=f"wk_subj_{hub}")
+    body = st.text_area("Message body (edit before sending to HQ)", value=body, height=220, key=f"wk_body_{hub}")
+
+    # Simple readout of computed totals for confidence
+    with st.expander("View computed daily counts (read-only)", expanded=False):
+        df = pd.DataFrame(days, columns=["Date","Drop-offs"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.metric("Computed weekly total", total)
+
+    # Send to all Admins in a single consistent thread
+    admins = [u[0] for u in query("SELECT username FROM users WHERE LOWER(role)='admin'")]
+    disabled = (not admins) or (total < 0) or (not subj.strip()) or (not body.strip())
+    if st.button("Send to HQ (Admins)", disabled=disabled, key=f"wk_send_{hub}"):
+        if not admins:
+            st.error("No HQ users found. Ask an admin to create an Admin user.")
+        else:
+            tid = _weekly_thread_id(hub, ws)
+            sent_ok = 0; sent_err = 0
+            for adm in admins:
+                try:
+                    send_message(
+                        sender=username,
+                        recipient=adm,
+                        subject=subj.strip(),
+                        body=body.strip(),
+                        msg_type="weekly_dropoffs",
+                        thread_id=tid,
+                        hub=hub,
+                        shipped_count=int(total),
+                        range_start=ws.isoformat(),
+                        range_end=we.isoformat(),
+                        paid_count=None,
+                        meta=None
+                    )
+                    sent_ok += 1
+                except ValueError:
+                    sent_err += 1
+            if sent_ok:
+                st.success(f"Weekly summary sent to {sent_ok} HQ user(s).")
+            if sent_err:
+                st.error(f"{sent_err} message(s) blocked by policy.")
+            st.rerun()
+
+    st.divider()
+    st.caption("Thread history (this hub & week)")
+    hist = _weekly_thread_history(hub, ws)
+    if not hist:
+        st.info("No messages yet for this week.")
+    else:
+        for _id, ts, snd, rcp, sub, bod, tid, mtype, r_at, mhub, scnt, rs, re_, pcnt, meta in hist:
+            badge = "🟧 Weekly" if mtype == "weekly_dropoffs" else "✉️"
+            st.markdown(f"**{snd} → {rcp}** · _{fmt_et(ts)}_ · {badge}")
+            st.write(bod)
+            st.caption(f"Count: {scnt or 0} · Range: {rs or '—'} → {re_ or '—'}")
+            st.divider()
 
 def hub_home_page(username: str, hub: Optional[str]):
     if not hub:
         st.info("No hub assigned to your user yet.")
         return
-    st.subheader(f"{hub} — Dashboard")
-    k = _hub_kpis(hub)
-    kcols = st.columns(4)
-    kcols[0].metric("SKUs stocked", k["skus"])
-    kcols[1].metric("On-hand pieces", k["qty"])
-    kcols[2].metric(f"Low stock (≤{LOW_STOCK_THRESHOLD})", k["low"])
-    kcols[3].metric("Shipments this week", k["ship_week"])
 
-    st.divider()
-    st.subheader("⚠️ Low stock")
-    ldf = _low_stock_df(hub)
-    if ldf.empty:
-        st.success("No low-stock SKUs.")
-    else:
-        st.dataframe(ldf, use_container_width=True, height=260)
-        st.download_button("Export low_stock.csv", ldf.to_csv(index=False).encode("utf-8"), "low_stock.csv", "text/csv")
+    st.subheader(f"{hub} — Home")
 
-    st.divider()
-    st.subheader("📦 Incoming Shipments")
-    sdf = _recent_shipments_df(hub, days=90)
-    if sdf.empty:
-        st.info("No recent shipments.")
-    else:
-        st.dataframe(sdf, use_container_width=True, height=260)
-        open_rows = query("SELECT id, tracking, carrier, skus, status FROM shipments WHERE hub=? AND status IN ('Created','In Transit') ORDER BY id DESC", (hub,))
-        if open_rows:
-            st.caption("Open shipments (confirm to auto-IN inventory):")
-            for sid, trk, car, skus_str, status in open_rows[:50]:
-                cols = st.columns([3,2,2,2,2])
-                cols[0].markdown(f"**#{sid}** · {status}")
-                cols[1].markdown(f"Carrier: {car or '—'}")
-                cols[2].markdown(f"Tracking: {trk or '—'}")
-                if cols[3].button("Mark In Transit", key=f"mit_{sid}"):
-                    query("UPDATE shipments SET status=?, date=? WHERE id=?", ("In Transit", _now_iso(), sid), fetch=False, commit=True)
-                    st.success(f"Shipment #{sid} marked In Transit."); st.rerun()
-                if cols[4].button("Confirm Received", key=f"rcv_{sid}"):
-                    ok, msg = _confirm_receive_shipment(sid, hub, username)
-                    if ok:
-                        st.success(msg); st.rerun()
-                    else:
-                        st.error(msg)
+    # Added one more tab: "💵 Weekly"
+    tabs = st.tabs(["📊 Dashboard", "📮 Drop-offs", "📈 Reports", "💵 Weekly"])
+
+    # --- Dashboard ---
+    with tabs[0]:
+        k = _hub_kpis(hub)
+        kcols = st.columns(4)
+        kcols[0].metric("SKUs stocked", k["skus"])
+        kcols[1].metric("On-hand pieces", k["qty"])
+        kcols[2].metric(f"Low stock (≤{LOW_STOCK_THRESHOLD})", k["low"])
+        kcols[3].metric("Shipments this week", k["ship_week"])
+
+        st.divider()
+        st.subheader("⚠️ Low stock")
+        ldf = _low_stock_df(hub)
+        if ldf.empty:
+            st.success("No low-stock SKUs.")
+        else:
+            st.dataframe(ldf, use_container_width=True, height=260)
+            st.download_button("Export low_stock.csv", ldf.to_csv(index=False).encode("utf-8"), "low_stock.csv", "text/csv")
+
+        st.divider()
+        st.subheader("📦 Incoming Shipments")
+        sdf = _recent_shipments_df(hub, days=90)
+        if sdf.empty:
+            st.info("No recent shipments.")
+        else:
+            st.dataframe(sdf, use_container_width=True, height=260)
+            open_rows = query("SELECT id, tracking, carrier, skus, status FROM shipments WHERE hub=? AND status IN ('Created','In Transit') ORDER BY id DESC", (hub,))
+            if open_rows:
+                st.caption("Open shipments (confirm to auto-IN inventory):")
+                for sid, trk, car, skus_str, status in open_rows[:50]:
+                    cols = st.columns([3,2,2,2,2])
+                    cols[0].markdown(f"**#{sid}** · {status}")
+                    cols[1].markdown(f"Carrier: {car or '—'}")
+                    cols[2].markdown(f"Tracking: {trk or '—'}")
+                    if cols[3].button("Mark In Transit", key=f"mit_{sid}"):
+                        query("UPDATE shipments SET status=?, date=? WHERE id=?", ("In Transit", _now_iso(), sid), fetch=False, commit=True)
+                        st.success(f"Shipment #{sid} marked In Transit."); st.rerun()
+                    if cols[4].button("Confirm Received", key=f"rcv_{sid}"):
+                        ok, msg = _confirm_receive_shipment(sid, hub, username)
+                        if ok:
+                            st.success(msg); st.rerun()
+                        else:
+                            st.error(msg)
+
+    # --- Drop-offs ---
+    with tabs[1]:
+        st.subheader("Post Office Drop-off")
+        d_date = st.date_input("Date", value=date.today())
+        d_cnt = st.number_input("Orders dropped off", min_value=0, step=1, value=0)
+        receipt = st.file_uploader("Receipt (optional image/PDF)", type=["jpg","jpeg","png","pdf","gif","webp"])
+        note = st.text_input("Note (optional)")
+        if st.button("Submit drop-off"):
+            admins = [u[0] for u in query("SELECT username FROM users WHERE LOWER(role)='admin'")]
+            if not admins:
+                st.error("No admin users found."); 
+            elif d_cnt <= 0:
+                st.warning("Enter a drop-off count > 0.")
+            else:
+                rpath = _save_receipt_file(username, hub, receipt) if receipt else None
+                meta = json.dumps({"receipt_path": rpath}) if rpath else None
+                subj = f"[DROPOFF] {hub} {d_date.isoformat()} — {int(d_cnt)} orders"
+                body = note or f"{hub}: dropped off {int(d_cnt)} orders on {d_date.isoformat()}"
+                for adm in admins:
+                    try:
+                        send_message(username, adm, subject=subj, body=body, msg_type="dropoff_report", hub=hub,
+                                     shipped_count=int(d_cnt), range_start=d_date.isoformat(), range_end=d_date.isoformat(),
+                                     meta=meta)
+                    except ValueError:
+                        pass
+                st.success("Drop-off reported to HQ.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("My Recent Drop-offs")
+        rows = query("""
+          SELECT timestamp, shipped_count, shipped_range_start, meta
+          FROM messages
+          WHERE sender=? AND msg_type='dropoff_report'
+          ORDER BY timestamp DESC LIMIT 50
+        """, (username,))
+        if not rows:
+            st.info("No drop-offs yet.")
+        else:
+            for ts, cnt, rs, meta in rows:
+                cols = st.columns([2,2,6,2])
+                cols[0].markdown(fmt_et(ts))
+                cols[1].markdown(f"{cnt} orders")
+                cols[2].markdown(f"Date: {rs}")
+                # show small receipt link if available
+                if meta:
+                    try:
+                        md = json.loads(meta)
+                        rp = md.get("receipt_path")
+                        if rp and Path(rp).exists():
+                            cols[3].markdown("🧾 receipt")
+                            st.image(rp, use_column_width=True)
+                    except Exception:
+                        pass
+                st.divider()
+
+    # --- Reports ---
+    with tabs[2]:
+        st.subheader("KISS Reports")
+        c1, c2 = st.columns(2)
+        with c1:
+            r_from = st.date_input("From", value=date.today()-timedelta(days=30), key="hub_r_from")
+        with c2:
+            r_to = st.date_input("To", value=date.today(), key="hub_r_to")
+
+        # Total drop-offs
+        total_drop = _hub_dropoffs_sum(hub, r_from, r_to)
+        st.metric("Total drop-offs in range", total_drop)
+
+        st.divider()
+        st.markdown("**Top 5 SKUs by on-hand (current)**")
+        t5 = _hub_top5_df(hub)
+        st.dataframe(t5, use_container_width=True, height=220)
+        st.download_button("Export top5.csv", t5.to_csv(index=False).encode("utf-8"), "top5.csv", "text/csv")
+
+    # --- Weekly (new) ---
+    with tabs[3]:
+        _hub_weekly_tab(username, hub)
 
 # --- Supplier Home ------------------------------------------------------------
 CARRIERS = ["UPS", "USPS", "FedEx", "DHL", "Other…"]
@@ -1173,7 +1455,7 @@ def supplier_home_page(username: str):
         st.info("No shipments yet.")
     else:
         for (sid, sdate, shub, scar, strk, sst, sskus) in rows[:200]:
-            st.markdown(f"**#{sid}** · {fmt_ts_et(sdate)} · Hub: {shub} · Status: {sst}")
+            st.markdown(f"**#{sid}** · {fmt_et(sdate)} · Hub: {shub} · Status: {sst}")
             c = st.columns([2,3,3,2,2])
             with c[0]:
                 st.caption(f"Items: {sskus}")
@@ -1528,7 +1810,7 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
             sku_t = tcols[2].selectbox("SKU", [r[0] for r in query("SELECT DISTINCT sku FROM inventory ORDER BY sku")], key="t_sku")
             qty_t = tcols[3].number_input("Qty", min_value=1, step=1, value=1, key="t_qty")
             note_t = tcols[4].text_input("Note", key="t_note")
-            if st.button("Execute transfer"):
+            if st.button("Execute transfer", disabled=(src==dst)):
                 src_row = query("SELECT quantity FROM inventory WHERE sku=? AND hub=?", (sku_t, src))
                 src_qty = int(src_row[0][0]) if src_row else 0
                 if qty_t > src_qty:
@@ -1585,13 +1867,11 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
 
 # --- Main app -----------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="KISS Inventory", layout="wide")
-    st.sidebar.caption("ET")
-    st.sidebar.caption(fmt_ts_et(_now_iso()))
-    st.sidebar.caption(f" {APP_VERSION}")
-
-    st.title("KISS Inventory")
-    st.caption("Keep It Simple Socks — Inventory & Ops")
+    st.set_page_config(page_title=APP_NAME, layout="wide")
+    st.title(APP_NAME)
+    # Header right: live ET clock
+    st.caption(f"NY time: {et_now_dt().strftime('%a %b %d, %I:%M %p ET')}")
+    st.caption(APP_TAGLINE)
 
     # auth gate
     user = st.session_state.get("auth_user")
@@ -1602,10 +1882,11 @@ def main():
     username, role, hub = user
     coltop = st.columns([3,1])
     with coltop[0]:
-        st.success(f"Welcome, **{username}** ({role}{' — '+hub if hub else ''})")
         last = last_login_for(username)
+        welcome = f"Welcome, **{username}** ({role}{' — '+hub if hub else ''})"
         if last:
-            st.caption(f"Last sign-in: {last}")
+            welcome += f" · Last sign-in: {last}"
+        st.success(welcome)
     with coltop[1]:
         if st.button("Log out"):
             logout(); st.rerun()
