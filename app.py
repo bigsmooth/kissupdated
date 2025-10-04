@@ -15,14 +15,19 @@ from streamlit.components.v1 import html as _html
 def _register_pwa():
     _html("""
     <link rel="manifest" href="/manifest.json">
-    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <link rel="apple-touch-icon" sizes="180x180"
+          href="https://raw.githubusercontent.com/bigsmooth/kissupdated/main/app_edge/icons/apple-touch-icon.png?v=2">
+    <link rel="icon" href="https://raw.githubusercontent.com/bigsmooth/kissupdated/main/app_edge/icons/favicon.ico?v=2">
     <meta name="theme-color" content="#111827">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <script>
       if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/service-worker.js').catch(console.error);
+        navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
       }
     </script>
     """, height=0)
+
 
 # --- Mobile helpers (KISS) ----------------------------------------------------
 def is_mobile() -> bool:
