@@ -1,0 +1,20 @@
+server {
+  listen       ${PORT};
+  server_name  _;
+
+  # PWA files from /app/app_edge (same-origin)
+  location = /manifest.json     { root /app/app_edge; try_files $uri =404; }
+  location = /service-worker.js { root /app/app_edge; add_header Cache-Control "no-cache"; try_files $uri =404; }
+  location = /offline.html      { root /app/app_edge; try_files $uri =404; }
+  location /icons/              { root /app/app_edge; try_files $uri $uri/ =404; }
+
+  # Everything else → Streamlit
+  location / {
+    proxy_pass http://127.0.0.1:${STREAMLIT_PORT};
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+  }
+}
