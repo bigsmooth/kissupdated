@@ -15,3 +15,11 @@ uploads/
 .streamlit/secrets.toml
 .env
 .DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.db
+uploads/
+.streamlit/secrets.toml
+.env
+.DS_Store

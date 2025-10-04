@@ -8,6 +8,46 @@ import json
 
 import streamlit as st
 import pandas as pd
+from streamlit.components.v1 import html as _html
+
+
+# put this near your imports (below the _html import)
+def _register_pwa():
+    _html("""
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <meta name="theme-color" content="#111827">
+    <script>
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/service-worker.js').catch(console.error);
+      }
+    </script>
+    """, height=0)
+
+# --- Mobile helpers (KISS) ----------------------------------------------------
+def is_mobile() -> bool:
+    return bool(st.session_state.get("mobile_mode", False))
+
+def apply_mobile_css():
+    if not is_mobile():
+        return
+    st.markdown("""
+    <style>
+      .block-container { padding-top: .5rem; padding-bottom: 3rem; }
+      [data-testid="stSidebar"] { width: 18rem !important; }
+      .stButton>button, .stDownloadButton>button { width: 100%; border-radius: 12px; padding: .8rem 1rem; }
+      .stTextInput input, .stNumberInput input, .stSelectbox > div, .stDateInput input { font-size: 1.05rem; }
+      .stTabs [data-baseweb="tab-list"] { flex-wrap: wrap; }
+      .stTabs [data-baseweb="tab"] { padding: .25rem .6rem; }
+      /* Keep tables scrollable instead of exploding the layout */
+      div[data-testid="stDataFrame"] { overflow-x: auto; }
+      /* Tighten gaps in columns */
+      [data-testid="column"] { row-gap: .35rem !important; }
+      /* Make expanders a bit denser */
+      .streamlit-expanderHeader { padding: .35rem .6rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
 
 # --- Branding (KISS): change via env or here ---
 APP_NAME = os.getenv("APP_NAME", "Tribe Inventory")
@@ -1868,11 +1908,20 @@ def inventory_page(username: str, role: str, user_hub: Optional[str]):
 # --- Main app -----------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_NAME, layout="wide")
+
+    # Register PWA (manifest + service worker) and apply mobile CSS if you use it
+    _register_pwa()
+    try:
+        apply_mobile_css()  # safe no-op if you didn't define it
+    except NameError:
+        pass
+
     st.title(APP_NAME)
     # Header right: live ET clock
     st.caption(f"NY time: {et_now_dt().strftime('%a %b %d, %I:%M %p ET')}")
     st.caption(APP_TAGLINE)
 
+    # ---- keep the rest of your existing main() body here exactly as before ----
     # auth gate
     user = st.session_state.get("auth_user")
     if not user:
@@ -1891,7 +1940,6 @@ def main():
         if st.button("Log out"):
             logout(); st.rerun()
 
-    # Sidebar nav based on role
     unread = unread_count(username)
     msgs_label = f"Messages 📬 ({unread})" if unread else "Messages 📬"
 
@@ -1920,6 +1968,6 @@ def main():
     else:
         hub_home_page(username, hub)
 
-# Make sure this is at the very end of app.py, not inside any function
+# Make sure this stays at the very end of the file:
 if __name__ == "__main__":
     main()
