@@ -1355,38 +1355,41 @@ def _save_receipt_file(username: str, hub: str, file) -> Optional[str]:
 def _hub_weekly_tab(username: str, hub: str):
     st.subheader("💵 Weekly Drop-offs (Mon–Sun)")
 
-    # Persist a week anchor in session_state so prev/next survives reruns
+    # Persist anchor date in session (drives the week)
     anchor_key = f"wk_anchor_{hub}"
     if anchor_key not in st.session_state:
         st.session_state[anchor_key] = date.today()
 
-    picked = st.date_input(
-        "Pick a date (we’ll use its Mon–Sun week)",
-        value=st.session_state[anchor_key],
-        key=f"wk_pick_{hub}"
-    )
-    # If user changed the date_input, update anchor
-    if picked != st.session_state[anchor_key]:
-        st.session_state[anchor_key] = picked
-
-    # Initial Mon–Sun for the anchor
-    ws, we = _week_bounds(st.session_state[anchor_key])
-
-    # Week navigation
+    # ---- Week navigation FIRST (so we can adjust state before widgets render) ----
     cnav = st.columns([1, 1, 4])
     if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
         new_anchor = st.session_state[anchor_key] - timedelta(days=7)
         st.session_state[anchor_key] = new_anchor
-        st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
+        # also seed the date_input's state before it exists this run
+        st.session_state[f"wk_pick_{hub}"] = new_anchor
         st.rerun()
 
     if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
         new_anchor = st.session_state[anchor_key] + timedelta(days=7)
         st.session_state[anchor_key] = new_anchor
-        st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
+        st.session_state[f"wk_pick_{hub}"] = new_anchor
         st.rerun()
 
-    # Recompute after possible change
+    # ---- Date picker (created AFTER nav so we don't mutate it post-instantiation)
+    # ensure a default for the widget's state
+    if f"wk_pick_{hub}" not in st.session_state:
+        st.session_state[f"wk_pick_{hub}"] = st.session_state[anchor_key]
+
+    picked = st.date_input(
+        "Pick a date (we’ll use its Mon–Sun week)",
+        value=st.session_state[f"wk_pick_{hub}"],
+        key=f"wk_pick_{hub}",
+    )
+    # If user changed the picker, update the anchor (never touch the widget state here)
+    if picked != st.session_state[anchor_key]:
+        st.session_state[anchor_key] = picked
+
+    # Compute Mon–Sun from anchor
     ws, we = _week_bounds(st.session_state[anchor_key])
     cnav[2].caption(f"Week window: **{ws.isoformat()} → {we.isoformat()}**")
 
@@ -1404,7 +1407,7 @@ def _hub_weekly_tab(username: str, hub: str):
     if body_state_key not in st.session_state:
         st.session_state[body_state_key] = body_default
 
-    # Use week-scoped keys; let state drive the value
+    # Inputs driven by state (auto-refresh per week)
     subj = st.text_input("Subject", key=subj_state_key)
     body = st.text_area("Message body (edit before sending to HQ)", height=220, key=body_state_key)
 
@@ -1461,7 +1464,6 @@ def _hub_weekly_tab(username: str, hub: str):
             st.write(bod)
             st.caption(f"Count: {scnt or 0} · Range: {rs or '—'} → {re_ or '—'}")
             st.divider()
-
 
 def hub_home_page(username: str, hub: Optional[str]):
     if not hub:
