@@ -1372,13 +1372,18 @@ def _hub_weekly_tab(username: str, hub: str):
     ws, we = _week_bounds(st.session_state[anchor_key])
 
     # Week navigation
-    cnav = st.columns([1,1,4])
-    if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
-        st.session_state[anchor_key] = st.session_state[anchor_key] - timedelta(days=7)
-        st.rerun()
-    if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
-        st.session_state[anchor_key] = st.session_state[anchor_key] + timedelta(days=7)
-        st.rerun()
+cnav = st.columns([1,1,4])
+if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
+    new_anchor = st.session_state[anchor_key] - timedelta(days=7)
+    st.session_state[anchor_key] = new_anchor
+    st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
+    st.rerun()
+
+if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
+    new_anchor = st.session_state[anchor_key] + timedelta(days=7)
+    st.session_state[anchor_key] = new_anchor
+    st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
+    st.rerun()
 
     # Recompute after possible change
     ws, we = _week_bounds(st.session_state[anchor_key])
