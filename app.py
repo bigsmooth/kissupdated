@@ -44,8 +44,11 @@ def apply_mobile_css():
       .stTextInput input, .stNumberInput input, .stSelectbox > div, .stDateInput input { font-size: 1.05rem; }
       .stTabs [data-baseweb="tab-list"] { flex-wrap: wrap; }
       .stTabs [data-baseweb="tab"] { padding: .25rem .6rem; }
+      /* Keep tables scrollable instead of exploding the layout */
       div[data-testid="stDataFrame"] { overflow-x: auto; }
+      /* Tighten gaps in columns */
       [data-testid="column"] { row-gap: .35rem !important; }
+      /* Make expanders a bit denser */
       .streamlit-expanderHeader { padding: .35rem .6rem; }
     </style>
     """, unsafe_allow_html=True)
@@ -94,17 +97,21 @@ def fmt_et(ts: str) -> str:
     s = (ts or "").strip()
     if not s:
         return "—"
+    # try a few common shapes
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
         try:
             dt = datetime.strptime(s.replace("T", " "), fmt.replace("T", " "))
+            # Treat as ET-naive; just display as 12h
             return dt.strftime("%b %d, %Y %I:%M %p ET")
         except Exception:
             continue
+    # last resort: show incoming
     return s
 
 # --- DB helpers ---------------------------------------------------------------
 def connect():
     con = sqlite3.connect(str(DB))
+    # Best-effort PRAGMAs (don’t crash if unsupported)
     try:
         con.execute("PRAGMA foreign_keys=ON")
         con.execute("PRAGMA journal_mode=WAL")
@@ -155,6 +162,7 @@ def hash_password(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
 def verify_password(plain: str, stored: str) -> bool:
+    # bcrypt hash?
     if stored and stored.startswith("$2"):
         if not bcrypt:
             return False
@@ -162,6 +170,7 @@ def verify_password(plain: str, stored: str) -> bool:
             return bcrypt.checkpw(plain.encode(), stored.encode())
         except Exception:
             return False
+    # legacy sha256 (64 hex)
     import re, hashlib
     if re.fullmatch(r"[0-9a-f]{64}", stored or ""):
         return hashlib.sha256(plain.encode()).hexdigest() == stored
@@ -175,10 +184,12 @@ def ensure_users_schema_and_seed():
         role TEXT,
         hub TEXT
     )""")
+    # MIGRATION: add 'disabled' column if missing
     cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "disabled" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN disabled INTEGER DEFAULT 0")
         cur.execute("UPDATE users SET disabled=0 WHERE disabled IS NULL")
+    # Seed only if empty
     cur.execute("SELECT COUNT(*) FROM users")
     n = cur.fetchone()[0]
     if n == 0:
@@ -286,6 +297,7 @@ def ensure_messages_schema():
         meta TEXT,
         archived_at TEXT
     )""")
+    # Ensure columns exist
     have = [r[1] for r in cur.execute("PRAGMA table_info(messages)").fetchall()]
     required = {
         "recipient":"TEXT","subject":"TEXT","body":"TEXT",
@@ -309,6 +321,7 @@ def unread_count(username: str) -> int:
 def _guard_message_send(sender: str, recipient: str) -> None:
     s_role = get_role(sender) or ""
     r_role = get_role(recipient) or ""
+    # Hubs/suppliers/etc can only message Admin (HQ). Admins can message anyone.
     if (s_role or "").lower() != "admin" and (r_role or "").lower() != "admin":
         raise ValueError("Only Admins (HQ) can be messaged by non-admin users.")
 
@@ -390,6 +403,7 @@ def mark_thread_read(username: str, thread_id: str):
           (_now_iso(), username, thread_id), fetch=False, commit=True)
 
 def mark_thread_read_for_all_inbox_recipients(thread_id: str):
+    # Convenience for admin replies to mark all recipients' copies read
     query("UPDATE messages SET read_at=? WHERE thread_id=? AND read_at IS NULL",
           (_now_iso(), thread_id), fetch=False, commit=True)
 
@@ -422,13 +436,15 @@ def get_sent(username: str):
     ensure_messages_schema()
     return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,"
                  "shipped_count,shipped_range_start,shipped_range_end,paid_count,meta,archived_at "
-                 "FROM messages WHERE sender=? ORDER BY timestamp DESC", (username,))
+                 "FROM messages WHERE sender=? ORDER BY timestamp DESC",
+                 (username,))
 
 def get_thread(thread_id: str):
     ensure_messages_schema()
     return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,"
                  "shipped_count,shipped_range_start,shipped_range_end,paid_count,meta "
-                 "FROM messages WHERE thread_id=? ORDER BY timestamp ASC", (thread_id,))
+                 "FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
+                 (thread_id,))
 
 def shipments_count_for(hub: str, start: str, end: str) -> int:
     try:
@@ -440,14 +456,17 @@ def shipments_count_for(hub: str, start: str, end: str) -> int:
 
 # --- Weekly helpers (Mon–Sun) -------------------------------------------------
 def _week_bounds(d: date) -> Tuple[date, date]:
+    """Return (monday, sunday) for the week containing date d."""
     monday = d - timedelta(days=d.weekday())
     sunday = monday + timedelta(days=6)
     return monday, sunday
 
 def _weekly_thread_id(hub: str, week_start: date) -> str:
+    """Deterministic thread ID so all weekly messages for that hub+week stay together."""
     return f"weekly:{hub}:{week_start.isoformat()}"
 
 def _hub_dropoffs_by_day(hub: str, start: date, end: date) -> List[Tuple[str, int]]:
+    """[(YYYY-MM-DD, count), ...] for that hub and date range based on dropoff_report messages."""
     rows = query("""
         SELECT shipped_range_start AS day, COALESCE(SUM(shipped_count),0) AS cnt
         FROM messages
@@ -460,6 +479,7 @@ def _hub_dropoffs_by_day(hub: str, start: date, end: date) -> List[Tuple[str, in
     return [(r[0], int(r[1])) for r in rows]
 
 def _weekly_lines(hub: str, week_start: date) -> Tuple[List[Tuple[str,int]], int, date]:
+    """Return ([(YYYY-MM-DD, count)..7 days], total, week_end)."""
     week_end = week_start + timedelta(days=6)
     by_day = dict(_hub_dropoffs_by_day(hub, week_start, week_end))
     days: List[Tuple[str,int]] = []
@@ -478,6 +498,7 @@ def _weekly_default_body(hub: str, ws: date, we: date, days: List[Tuple[str,int]
     lines = [f"{hub} — Weekly drop-offs (Mon–Sun)",
              f"Week: {ws.isoformat()} → {we.isoformat()}",
              "--------------------------------"]
+    # Label the days for readability
     day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     for (i, (ds, cnt)) in enumerate(days):
         lines.append(f"{day_names[i]} {ds}: {cnt}")
@@ -485,6 +506,7 @@ def _weekly_default_body(hub: str, ws: date, we: date, days: List[Tuple[str,int]
     return "\n".join(lines)
 
 def _weekly_thread_history(hub: str, ws: date) -> List[Tuple]:
+    """All messages in the weekly thread (any sender/recipient)."""
     tid = _weekly_thread_id(hub, ws)
     return get_thread(tid) or []
 
@@ -500,7 +522,8 @@ def _extract_notes_section(body: str) -> str:
     return body[start:].strip()
 
 def _latest_weekly_body_or_default(hub: str, ws: date, we: date) -> Tuple[str, str, int, List[Tuple[str,int]]]:
-    days, total, _ = _weekly_lines(hub, ws)
+    """Prefill editor with latest 'Notes' only; recompute Mon–Sun counts every time."""
+    days, total, _we = _weekly_lines(hub, ws)
     subj = _weekly_subject(hub, ws, we, total)
 
     history = _weekly_thread_history(hub, ws)
@@ -761,6 +784,7 @@ def ensure_shipments_schema():
         received_at TEXT,
         received_by TEXT
     )""")
+    # Add missing cols if legacy
     have = [r[1] for r in cur.execute("PRAGMA table_info(shipments)").fetchall()]
     for col, typ in {
         "supplier":"TEXT","tracking":"TEXT","carrier":"TEXT","hub":"TEXT","skus":"TEXT",
@@ -777,6 +801,15 @@ def _table_exists(name: str) -> bool:
     con.close()
     return ok
 
+# NEW: guard index creation by checking column existence
+def _column_exists(table: str, column: str) -> bool:
+    con = connect(); cur = con.cursor()
+    try:
+        cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+        return column in cols
+    finally:
+        con.close()
+
 def create_indices():
     con = connect(); cur = con.cursor()
     try:
@@ -786,7 +819,9 @@ def create_indices():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(msg_type)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_arch ON messages(recipient, archived_at)")
+            # Guard this with column existence (prevents startup crash)
+            if _column_exists("messages", "archived_at"):
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_arch ON messages(recipient, archived_at)")
         if _table_exists("logs"):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp)")
         if _table_exists("shipments"):
@@ -797,7 +832,8 @@ def create_indices():
 
 ensure_logs_schema()
 ensure_shipments_schema()
-create_indices()  # first attempt (guarded)
+ensure_messages_schema()   # ensure messages + migrations (adds archived_at) before indexing
+create_indices()           # first attempt (guarded)
 
 # --- Home helpers (admin/hub) -------------------------------------------------
 ADMIN_LOW_STOCK = 5
@@ -847,6 +883,7 @@ def restore_csv_tool():
     st.write("Preview (first 10 rows):")
     st.dataframe(df.head(10), use_container_width=True)
 
+    # Schema check
     try:
         conn_v = connect()
         cur_v = conn_v.cursor()
@@ -1005,8 +1042,10 @@ def admin_home_page():
             query("UPDATE users SET disabled=? WHERE username=?", (0 if dis else 1, uname), fetch=False, commit=True)
             st.rerun()
 
+
 # --- Admin: Catalog helpers ---------------------------------------------------
 def _get_all_skus() -> List[Tuple[str, str]]:
+    """Return list of (sku, assigned_hubs_csv)."""
     rows = query("SELECT sku, COALESCE(assigned_hubs,'') FROM sku_info ORDER BY sku")
     return [(r[0], r[1]) for r in rows]
 
@@ -1016,11 +1055,17 @@ def _merge_assignments(old_csv: str, to_add: List[str]) -> str:
     return ",".join(merged)
 
 def add_or_assign_sku_to_hubs(sku: str, hubs: List[str]):
+    """
+    - If SKU doesn't exist: create it in sku_info with product_name=sku and assigned_hubs = hubs CSV.
+    - If it exists: merge hubs into assigned_hubs.
+    - Ensure inventory rows exist (qty=0) for each selected hub.
+    """
     sku = (sku or "").strip()
     hubs = [h.strip() for h in hubs if h and h.strip()]
     if not sku or not hubs:
         return False, "SKU and hubs are required."
 
+    # Read existing
     rows = query("SELECT assigned_hubs FROM sku_info WHERE sku=?", (sku,))
     if rows:
         new_csv = _merge_assignments(rows[0][0], hubs)
@@ -1030,10 +1075,12 @@ def add_or_assign_sku_to_hubs(sku: str, hubs: List[str]):
         query("INSERT INTO sku_info (sku, product_name, assigned_hubs) VALUES (?,?,?)",
               (sku, sku, ",".join(sorted(set(hubs)))), fetch=False, commit=True)
 
+    # Ensure inventory rows (0) for each hub
     for h in hubs:
         query("INSERT OR IGNORE INTO inventory (sku, hub, quantity) VALUES (?,?,?)",
               (sku, h, 0), fetch=False, commit=True)
 
+    # Best-effort log
     try:
         query("INSERT INTO logs (timestamp,user,sku,hub,action,qty,comment) VALUES (?,?,?,?,?,?,?)",
               (_now_iso(), "admin", sku, None, "catalog_assign", None, f"hubs={hubs}"),
@@ -1055,6 +1102,7 @@ def _admin_receipts_viewer():
         hub_sel = st.selectbox("Hub (optional)", ["All"] + hubs)
         hub_filter = None if hub_sel == "All" else hub_sel
 
+    # Query dropoff messages
     sql = """
       SELECT id, timestamp, sender, hub, shipped_count, shipped_range_start, meta
       FROM messages
@@ -1136,6 +1184,7 @@ def admin_page(role: str):
     st.header("🛠️ Admin")
     tabs = st.tabs(["🏷️ Catalog", "📸 Receipts", "📊 Reports", "💽 Backups", "📥 CSV Restore"])
 
+    # --- Catalog tab (add/assign SKUs to hubs) ---
     with tabs[0]:
         st.subheader("Catalog (Add / Assign SKUs)")
         hubs_known = _hubs_list()
@@ -1170,12 +1219,15 @@ def admin_page(role: str):
         st.divider()
         st.caption("Note: Assigning an SKU to a hub creates a zero-qty row in **inventory**. Adjust quantities on the Inventory page.")
 
+    # --- Receipts viewer ---
     with tabs[1]:
         _admin_receipts_viewer()
 
+    # --- Reports ---
     with tabs[2]:
         _admin_reports_tab()
 
+    # --- Backups tab ---
     with tabs[3]:
         st.subheader("Back up & Restore SQLite DB")
         col = st.columns(3)
@@ -1227,6 +1279,7 @@ def admin_page(role: str):
                     except Exception as e:
                         st.error(f"Could not read backup {b.name}: {e}")
 
+    # --- CSV Restore tab ---
     with tabs[4]:
         restore_csv_tool()
 
@@ -1302,6 +1355,7 @@ def _save_receipt_file(username: str, hub: str, file) -> Optional[str]:
 def _hub_weekly_tab(username: str, hub: str):
     st.subheader("💵 Weekly Drop-offs (Mon–Sun)")
 
+    # Persist a week anchor in session_state so prev/next survives reruns
     anchor_key = f"wk_anchor_{hub}"
     if anchor_key not in st.session_state:
         st.session_state[anchor_key] = date.today()
@@ -1311,6 +1365,7 @@ def _hub_weekly_tab(username: str, hub: str):
         value=st.session_state[anchor_key],
         key=f"wk_pick_{hub}"
     )
+    # If user changed the date_input, update anchor
     if picked != st.session_state[anchor_key]:
         st.session_state[anchor_key] = picked
 
@@ -1323,19 +1378,23 @@ def _hub_weekly_tab(username: str, hub: str):
     if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
         st.session_state[anchor_key] = st.session_state[anchor_key] + timedelta(days=7)
         st.rerun()
+    # Recompute after possible change
     ws, we = _week_bounds(st.session_state[anchor_key])
     cnav[2].caption(f"Week window: **{ws.isoformat()} → {we.isoformat()}**")
 
+    # Suggest subject/body (reuse 'Notes' from last, recompute counts)
     subj, body, total, days = _latest_weekly_body_or_default(hub, ws, we)
 
     subj = st.text_input("Subject", value=subj, key=f"wk_subj_{hub}")
     body = st.text_area("Message body (edit before sending to HQ)", value=body, height=220, key=f"wk_body_{hub}")
 
+    # Simple readout of computed totals for confidence
     with st.expander("View computed daily counts (read-only)", expanded=False):
         df = pd.DataFrame(days, columns=["Date","Drop-offs"])
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.metric("Computed weekly total", total)
 
+    # Send to all Admins in a single consistent thread
     admins = [u[0] for u in query("SELECT username FROM users WHERE LOWER(role)='admin'")]
     disabled = (not admins) or (total < 0) or (not subj.strip()) or (not body.strip())
     if st.button("Send to HQ (Admins)", disabled=disabled, key=f"wk_send_{hub}"):
@@ -1389,8 +1448,10 @@ def hub_home_page(username: str, hub: Optional[str]):
 
     st.subheader(f"{hub} — Home")
 
+    # Added one more tab: "💵 Weekly"
     tabs = st.tabs(["📊 Dashboard", "📮 Drop-offs", "📈 Reports", "💵 Weekly"])
 
+    # --- Dashboard ---
     with tabs[0]:
         k = _hub_kpis(hub)
         kcols = st.columns(4)
@@ -1433,6 +1494,7 @@ def hub_home_page(username: str, hub: Optional[str]):
                         else:
                             st.error(msg)
 
+    # --- Drop-offs ---
     with tabs[1]:
         st.subheader("Post Office Drop-off")
         d_date = st.date_input("Date", value=date.today())
@@ -1476,6 +1538,7 @@ def hub_home_page(username: str, hub: Optional[str]):
                 cols[0].markdown(fmt_et(ts))
                 cols[1].markdown(f"{cnt} orders")
                 cols[2].markdown(f"Date: {rs}")
+                # show small receipt link if available
                 if meta:
                     try:
                         md = json.loads(meta)
@@ -1487,6 +1550,7 @@ def hub_home_page(username: str, hub: Optional[str]):
                         pass
                 st.divider()
 
+    # --- Reports ---
     with tabs[2]:
         st.subheader("KISS Reports")
         c1, c2 = st.columns(2)
@@ -1495,6 +1559,7 @@ def hub_home_page(username: str, hub: Optional[str]):
         with c2:
             r_to = st.date_input("To", value=date.today(), key="hub_r_to")
 
+        # Total drop-offs
         total_drop = _hub_dropoffs_sum(hub, r_from, r_to)
         st.metric("Total drop-offs in range", total_drop)
 
@@ -1504,6 +1569,7 @@ def hub_home_page(username: str, hub: Optional[str]):
         st.dataframe(t5, use_container_width=True, height=220)
         st.download_button("Export top5.csv", t5.to_csv(index=False).encode("utf-8"), "top5.csv", "text/csv")
 
+    # --- Weekly (new) ---
     with tabs[3]:
         _hub_weekly_tab(username, hub)
 
@@ -1805,7 +1871,8 @@ def seed_sku_inventory_if_empty():
 
 ensure_sku_inventory_schemas()
 seed_sku_inventory_if_empty()
-create_indices()  # run again now that tables exist
+ensure_messages_schema()  # ensure messaging schema exists here too
+create_indices()          # run again now that tables exist
 
 # ===== Section 7: Inventory (clean Hubs UI + list + IN/OUT + transfer + count)
 def _hub_stats() -> pd.DataFrame:
@@ -2040,14 +2107,16 @@ def main():
     # Register PWA (manifest + service worker) and apply mobile CSS if you use it
     _register_pwa()
     try:
-        apply_mobile_css()
+        apply_mobile_css()  # safe no-op if you didn't define it
     except NameError:
         pass
 
     st.title(APP_NAME)
+    # Header right: live ET clock
     st.caption(f"NY time: {et_now_dt().strftime('%a %b %d, %I:%M %p ET')}")
     st.caption(APP_TAGLINE)
 
+    # auth gate
     user = st.session_state.get("auth_user")
     if not user:
         login_form()
