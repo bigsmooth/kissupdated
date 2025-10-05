@@ -23,3 +23,7 @@ uploads/
 .streamlit/secrets.toml
 .env
 .DS_Store
+
+# Local data
+*.db
+uploads/
