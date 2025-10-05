@@ -1369,21 +1369,22 @@ def _hub_weekly_tab(username: str, hub: str):
     if picked != st.session_state[anchor_key]:
         st.session_state[anchor_key] = picked
 
+    # Initial Mon–Sun for the anchor
     ws, we = _week_bounds(st.session_state[anchor_key])
 
     # Week navigation
-cnav = st.columns([1,1,4])
-if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
-    new_anchor = st.session_state[anchor_key] - timedelta(days=7)
-    st.session_state[anchor_key] = new_anchor
-    st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
-    st.rerun()
+    cnav = st.columns([1, 1, 4])
+    if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
+        new_anchor = st.session_state[anchor_key] - timedelta(days=7)
+        st.session_state[anchor_key] = new_anchor
+        st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
+        st.rerun()
 
-if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
-    new_anchor = st.session_state[anchor_key] + timedelta(days=7)
-    st.session_state[anchor_key] = new_anchor
-    st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
-    st.rerun()
+    if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
+        new_anchor = st.session_state[anchor_key] + timedelta(days=7)
+        st.session_state[anchor_key] = new_anchor
+        st.session_state[f"wk_pick_{hub}"] = new_anchor  # keep date_input in sync
+        st.rerun()
 
     # Recompute after possible change
     ws, we = _week_bounds(st.session_state[anchor_key])
@@ -1409,7 +1410,7 @@ if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
 
     # Simple readout of computed totals for confidence
     with st.expander("View computed daily counts (read-only)", expanded=False):
-        df = pd.DataFrame(days, columns=["Date","Drop-offs"])
+        df = pd.DataFrame(days, columns=["Date", "Drop-offs"])
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.metric("Computed weekly total", total)
 
@@ -1421,7 +1422,8 @@ if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
             st.error("No HQ users found. Ask an admin to create an Admin user.")
         else:
             tid = _weekly_thread_id(hub, ws)
-            sent_ok = 0; sent_err = 0
+            sent_ok = 0
+            sent_err = 0
             for adm in admins:
                 try:
                     send_message(
@@ -1436,7 +1438,7 @@ if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
                         range_start=ws.isoformat(),
                         range_end=we.isoformat(),
                         paid_count=None,
-                        meta=None
+                        meta=None,
                     )
                     sent_ok += 1
                 except ValueError:
