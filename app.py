@@ -1371,6 +1371,7 @@ def _hub_weekly_tab(username: str, hub: str):
 
     ws, we = _week_bounds(st.session_state[anchor_key])
 
+    # Week navigation
     cnav = st.columns([1,1,4])
     if cnav[0].button("⟵ Prev week", key=f"wk_prev_{hub}"):
         st.session_state[anchor_key] = st.session_state[anchor_key] - timedelta(days=7)
@@ -1378,15 +1379,28 @@ def _hub_weekly_tab(username: str, hub: str):
     if cnav[1].button("Next week ⟶", key=f"wk_next_{hub}"):
         st.session_state[anchor_key] = st.session_state[anchor_key] + timedelta(days=7)
         st.rerun()
+
     # Recompute after possible change
     ws, we = _week_bounds(st.session_state[anchor_key])
     cnav[2].caption(f"Week window: **{ws.isoformat()} → {we.isoformat()}**")
 
-    # Suggest subject/body (reuse 'Notes' from last, recompute counts)
-    subj, body, total, days = _latest_weekly_body_or_default(hub, ws, we)
+    # --- week-scoped keys so inputs refresh when switching weeks ---
+    week_key = f"{hub}_{ws.isoformat()}"
+    subj_state_key = f"wk_subj_{week_key}"
+    body_state_key = f"wk_body_{week_key}"
 
-    subj = st.text_input("Subject", value=subj, key=f"wk_subj_{hub}")
-    body = st.text_area("Message body (edit before sending to HQ)", value=body, height=220, key=f"wk_body_{hub}")
+    # Fresh defaults for THIS week (counts recomputed every time)
+    subj_default, body_default, total, days = _latest_weekly_body_or_default(hub, ws, we)
+
+    # Seed state only the first time we view this week
+    if subj_state_key not in st.session_state:
+        st.session_state[subj_state_key] = subj_default
+    if body_state_key not in st.session_state:
+        st.session_state[body_state_key] = body_default
+
+    # Use week-scoped keys; let state drive the value
+    subj = st.text_input("Subject", key=subj_state_key)
+    body = st.text_area("Message body (edit before sending to HQ)", height=220, key=body_state_key)
 
     # Simple readout of computed totals for confidence
     with st.expander("View computed daily counts (read-only)", expanded=False):
@@ -1440,6 +1454,7 @@ def _hub_weekly_tab(username: str, hub: str):
             st.write(bod)
             st.caption(f"Count: {scnt or 0} · Range: {rs or '—'} → {re_ or '—'}")
             st.divider()
+
 
 def hub_home_page(username: str, hub: Optional[str]):
     if not hub:
