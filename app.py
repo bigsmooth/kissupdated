@@ -58,6 +58,11 @@ def apply_mobile_css():
 APP_NAME = os.getenv("APP_NAME", "Tribe Inventory")
 APP_TAGLINE = os.getenv("APP_TAGLINE", "Tribe — Inventory & Ops")
 
+# --- Messaging/UI limits (no DB changes) -------------------------------------
+MESSAGE_SUBJECT_MAX = int(os.getenv("MESSAGE_SUBJECT_MAX", "160"))
+MESSAGE_BODY_MAX    = int(os.getenv("MESSAGE_BODY_MAX", "8000"))
+UPLOAD_MAX_BYTES    = int(os.getenv("UPLOAD_MAX_BYTES", str(6 * 1024 * 1024)))  # 6 MB
+
 # --- Config: DB path (env var or local file)
 DB = Path(os.getenv("TTT_DB_PATH", Path(__file__).parent / "ttt_inventory.db"))
 DB.parent.mkdir(parents=True, exist_ok=True)  # make sure folder exists
@@ -66,10 +71,6 @@ DB.parent.mkdir(parents=True, exist_ok=True)  # make sure folder exists
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", DB.parent / "uploads"))
 DROP_DIR = UPLOADS_DIR / "dropoffs"
 DROP_DIR.mkdir(parents=True, exist_ok=True)
-
-# NEW: message attachments dir
-MSG_DIR = UPLOADS_DIR / "messages"
-MSG_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- ET timezone helpers ------------------------------------------------------
 try:
@@ -213,20 +214,6 @@ def get_role(username: str) -> Optional[str]:
     r = query("SELECT role FROM users WHERE username=?", (username,))
     return (r[0][0] if r else None)
 
-def ensure_logs_schema():
-    con = connect(); cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT,
-        user TEXT,
-        sku TEXT,
-        hub TEXT,
-        action TEXT,
-        qty INTEGER,
-        comment TEXT
-    )""")
-    con.commit(); con.close()
-
 def login(username: str, password: str):
     rows = query("SELECT username, password, role, hub, disabled FROM users WHERE username=?", (username,))
     if not rows:
@@ -294,8 +281,7 @@ def ensure_messages_schema():
         shipped_range_start TEXT,
         shipped_range_end TEXT,
         paid_count INTEGER,
-        meta TEXT,
-        archived_at TEXT
+        meta TEXT
     )""")
     # Ensure columns exist
     have = [r[1] for r in cur.execute("PRAGMA table_info(messages)").fetchall()]
@@ -303,7 +289,7 @@ def ensure_messages_schema():
         "recipient":"TEXT","subject":"TEXT","body":"TEXT",
         "thread_id":"TEXT","msg_type":"TEXT","read_at":"TEXT","hub":"TEXT",
         "shipped_count":"INTEGER","shipped_range_start":"TEXT","shipped_range_end":"TEXT",
-        "paid_count":"INTEGER","meta":"TEXT","archived_at":"TEXT"
+        "paid_count":"INTEGER","meta":"TEXT"
     }
     for col, coltype in required.items():
         if col not in have:
@@ -313,7 +299,7 @@ def ensure_messages_schema():
 def unread_count(username: str) -> int:
     try:
         ensure_messages_schema()
-        row = query("SELECT COUNT(*) FROM messages WHERE recipient=? AND read_at IS NULL AND archived_at IS NULL", (username,))
+        row = query("SELECT COUNT(*) FROM messages WHERE recipient=? AND read_at IS NULL", (username,))
         return int(row[0][0]) if row else 0
     except Exception:
         return 0
@@ -325,68 +311,29 @@ def _guard_message_send(sender: str, recipient: str) -> None:
     if (s_role or "").lower() != "admin" and (r_role or "").lower() != "admin":
         raise ValueError("Only Admins (HQ) can be messaged by non-admin users.")
 
-# --- Messaging helpers: attachments & archive ---------------------------------
-def _save_message_attachments(files) -> List[str]:
-    saved: List[str] = []
-    if not files:
-        return saved
-    try:
-        ts = et_now_dt().strftime("%Y%m%d-%H%M%S")
-        for f in files:
-            raw_name = Path(getattr(f, "name", "file")).name
-            safe_name = f"{ts}_{raw_name}".replace("/", "_")
-            path = MSG_DIR / safe_name
-            path.write_bytes(f.getbuffer())
-            saved.append(str(path))
-    except Exception:
-        pass
-    return saved
-
-def _attachments_from_meta(meta: Optional[str]) -> List[str]:
-    try:
-        if not meta: return []
-        md = json.loads(meta)
-        at = md.get("attachments", [])
-        return [p for p in at if isinstance(p, str)]
-    except Exception:
-        return []
-
-def _merge_meta_with_attachments(meta: Optional[str], new_paths: List[str]) -> str:
-    base = {}
-    try:
-        if meta:
-            base = json.loads(meta)
-    except Exception:
-        base = {}
-    if new_paths:
-        prev = base.get("attachments", [])
-        merged = list(dict.fromkeys([*prev, *new_paths]))
-        base["attachments"] = merged
-    return json.dumps(base) if base else (json.dumps({"attachments": new_paths}) if new_paths else (meta or ""))
-
-def archive_thread(username: str, thread_id: str, archive: bool = True):
-    ensure_messages_schema()
-    query(
-        "UPDATE messages SET archived_at=? WHERE recipient=? AND thread_id=?",
-        (_now_iso() if archive else None, username, thread_id),
-        fetch=False, commit=True
-    )
-
 def send_message(sender: str, recipient: str, subject: str, body: str,
                  msg_type: str="message", thread_id: Optional[str]=None, hub: Optional[str]=None,
                  shipped_count: Optional[int]=None, range_start: Optional[str]=None, range_end: Optional[str]=None,
-                 paid_count: Optional[int]=None, meta: Optional[str]=None, attachments: Optional[List[str]]=None):
+                 paid_count: Optional[int]=None, meta: Optional[str]=None):
     import uuid
     ensure_messages_schema()
     _guard_message_send(sender, recipient)
+
+    # soft guards (no schema change): trim overlong text
+    subject = (subject or "").strip()
+    body = (body or "").strip()
+    if len(subject) > MESSAGE_SUBJECT_MAX:
+        subject = subject[:MESSAGE_SUBJECT_MAX]
+    if len(body) > MESSAGE_BODY_MAX:
+        body = body[:MESSAGE_BODY_MAX]
+
     if not thread_id:
         thread_id = str(uuid.uuid4())
-    meta_final = _merge_meta_with_attachments(meta, attachments or [])
     query("""INSERT INTO messages (timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,
-                                   shipped_count,shipped_range_start,shipped_range_end,paid_count,meta,archived_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)""",
+                                   shipped_count,shipped_range_start,shipped_range_end,paid_count,meta)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (_now_iso(), sender, recipient, subject, body, thread_id, msg_type, None, hub,
-           shipped_count, range_start, range_end, paid_count, meta_final),
+           shipped_count, range_start, range_end, paid_count, meta),
           fetch=False, commit=True)
     try:
         ensure_logs_schema()
@@ -407,43 +354,30 @@ def mark_thread_read_for_all_inbox_recipients(thread_id: str):
     query("UPDATE messages SET read_at=? WHERE thread_id=? AND read_at IS NULL",
           (_now_iso(), thread_id), fetch=False, commit=True)
 
-def get_inbox(username: str, only_unread: bool=False, filter_type: Optional[str]=None,
-              include_archived: bool=False, since: Optional[str]=None, until: Optional[str]=None,
-              text_query: Optional[str]=None):
+def mark_all_read(username: str):
+    query("UPDATE messages SET read_at=? WHERE recipient=? AND read_at IS NULL",
+          (_now_iso(), username), fetch=False, commit=True)
+
+def get_inbox(username: str, only_unread: bool=False, filter_type: Optional[str]=None):
     ensure_messages_schema()
-    sql = ("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,"
-           "shipped_count,shipped_range_start,shipped_range_end,paid_count,meta,archived_at "
-           "FROM messages WHERE recipient=?")
+    sql = "SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count,meta FROM messages WHERE recipient=?"
     params: List = [username]
-    if not include_archived:
-        sql += " AND archived_at IS NULL"
     if only_unread:
         sql += " AND read_at IS NULL"
     if filter_type:
-        sql += " AND msg_type=?"; params.append(filter_type)
-    if since:
-        sql += " AND date(timestamp) >= date(?)"; params.append(since)
-    if until:
-        sql += " AND date(timestamp) <= date(?)"; params.append(until)
-    if text_query and text_query.strip():
-        q = f"%{text_query.strip().lower()}%"
-        sql += " AND (LOWER(subject) LIKE ? OR LOWER(body) LIKE ? OR LOWER(sender) LIKE ?)"
-        params.extend([q, q, q])
+        sql += " AND msg_type=?"
+        params.append(filter_type)
     sql += " ORDER BY timestamp DESC"
     return query(sql, tuple(params))
 
 def get_sent(username: str):
     ensure_messages_schema()
-    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,"
-                 "shipped_count,shipped_range_start,shipped_range_end,paid_count,meta,archived_at "
-                 "FROM messages WHERE sender=? ORDER BY timestamp DESC",
+    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count,meta FROM messages WHERE sender=? ORDER BY timestamp DESC",
                  (username,))
 
 def get_thread(thread_id: str):
     ensure_messages_schema()
-    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,"
-                 "shipped_count,shipped_range_start,shipped_range_end,paid_count,meta "
-                 "FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
+    return query("SELECT id,timestamp,sender,recipient,subject,body,thread_id,msg_type,read_at,hub,shipped_count,shipped_range_start,shipped_range_end,paid_count,meta FROM messages WHERE thread_id=? ORDER BY timestamp ASC",
                  (thread_id,))
 
 def shipments_count_for(hub: str, start: str, end: str) -> int:
@@ -510,38 +444,18 @@ def _weekly_thread_history(hub: str, ws: date) -> List[Tuple]:
     tid = _weekly_thread_id(hub, ws)
     return get_thread(tid) or []
 
-# --- Weekly prefill fix: carry Notes only; always recompute counts ------------
-def _extract_notes_section(body: str) -> str:
-    import re
-    if not body:
-        return ""
-    m = list(re.finditer(r'(?im)^\s*notes\s*:\s*', body))
-    if not m:
-        return ""
-    start = m[-1].end()
-    return body[start:].strip()
-
 def _latest_weekly_body_or_default(hub: str, ws: date, we: date) -> Tuple[str, str, int, List[Tuple[str,int]]]:
-    """Prefill editor with latest 'Notes' only; recompute Mon–Sun counts every time."""
+    """Prefill editor with latest body from the thread, else default draft."""
     days, total, _we = _weekly_lines(hub, ws)
-    subj = _weekly_subject(hub, ws, we, total)
-
     history = _weekly_thread_history(hub, ws)
-    last_weekly_body = None
     if history:
-        weekly_msgs = [row for row in history if (row[7] == "weekly_dropoffs")]
-        if weekly_msgs:
-            last_weekly_body = (weekly_msgs[-1][5] or "")
-
+        # Use the last message body in the thread as starting point
+        last_body = history[-1][5] or ""
+        last_subj = history[-1][4] or _weekly_subject(hub, ws, we, total)
+        return last_subj, last_body, total, days
+    # No history: make a clean draft
+    subj = _weekly_subject(hub, ws, we, total)
     body = _weekly_default_body(hub, ws, we, days, total)
-
-    if last_weekly_body:
-        carried = _extract_notes_section(last_weekly_body)
-        if carried:
-            if "Notes:" in body:
-                prefix = body.rsplit("Notes:", 1)[0]
-                body = prefix + "Notes:\n" + carried
-
     return subj, body, total, days
 
 # ===== section 4: messaging UI page ==========================================
@@ -567,32 +481,30 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
 
     # --- inbox ---
     with tabs[0]:
-        fx = st.columns([1,1,1,2,2,2])
-        only_unread = fx[0].checkbox("Unread only", value=False)
-        show_arch = fx[1].checkbox("Show archived", value=False)
-        ftype = fx[2].selectbox("Type", ["All","paid_notice","shipped_report","dropoff_report","weekly_dropoffs","message"], index=0)
-        ftype = None if ftype=="All" else ftype
-        since = fx[3].date_input("From", value=date.today()-timedelta(days=30))
-        until = fx[4].date_input("To", value=date.today())
-        textq = fx[5].text_input("Search", placeholder="subject, body, or sender")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        only_unread = c1.checkbox("Unread only", value=False)
+        f_all = c2.button("All")
+        f_paid = c3.button("Paid")
+        f_ship = c4.button("Shipped")
+        f_drop = c5.button("Drop-offs")
+        f_week = c6.button("Weekly")
 
-        inbox = get_inbox(
-            current_user,
-            only_unread=only_unread,
-            filter_type=ftype,
-            include_archived=show_arch,
-            since=since.isoformat() if since else None,
-            until=until.isoformat() if until else None,
-            text_query=textq,
-        )
+        # NEW: quick search & mark-all
+        s_col, m_col = st.columns([3,1])
+        search_text = s_col.text_input("Search (subject/body)", "", placeholder="type to filter…", label_visibility="collapsed")
+        if m_col.button("Mark all read"):
+            mark_all_read(current_user); st.rerun()
 
-        # Bulk actions
-        cols_bulk = st.columns([2,8])
-        if cols_bulk[0].button("Mark all visible read"):
-            tids = sorted({r[6] for r in (inbox or [])})
-            for tid in tids:
-                mark_thread_read(current_user, tid)
-            st.success(f"Marked {len(tids)} thread(s) read."); st.rerun()
+        ftype = None
+        if f_paid: ftype = "paid_notice"
+        elif f_ship: ftype = "shipped_report"
+        elif f_drop: ftype = "dropoff_report"
+        elif f_week: ftype = "weekly_dropoffs"
+
+        inbox = get_inbox(current_user, only_unread=only_unread, filter_type=ftype)
+        if search_text.strip():
+            needle = search_text.strip().lower()
+            inbox = [r for r in inbox if (needle in (r[4] or "").lower()) or (needle in (r[5] or "").lower())]
 
         if not inbox:
             st.info("No messages.")
@@ -600,17 +512,13 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
             threads: Dict[str, list] = {}
             for r in inbox:
                 threads.setdefault(r[6], []).append(r)
-
-            for tid, items in list(threads.items())[:150]:
+            for tid, items in list(threads.items())[:100]:
                 latest = items[0]
-                any_unread = any(it[8] is None and it[3]==current_user for it in items)
-                is_archived = latest[15] is not None  # archived_at
-                label = f"{'🔵 ' if any_unread else ''}{latest[2]} • {latest[4]} • {fmt_et(latest[1])}{' • 🗄️ Archived' if is_archived else ''}"
-
+                unread = any(it[8] is None and it[3]==current_user for it in items)
+                label = f"{'🔵 ' if unread else ''}{latest[2]} • {latest[4]} • {fmt_et(latest[1])}"
                 with st.expander(label, expanded=False):
-                    # messages oldest->newest inside
                     for it in items[::-1]:
-                        _id, ts, snd, rcp, sub, body, _t, mtype, r_at, _hub, scnt, rs, re_, pcnt, meta, arch = it
+                        _id, ts, snd, rcp, sub, body, _t, mtype, r_at, _hub, scnt, rs, re_, pcnt, meta = it
                         badge = "✉️"
                         if mtype=="shipped_report": badge="🟣 Shipped"
                         elif mtype=="paid_notice": badge="🟢 Paid"
@@ -622,7 +530,6 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                             if rs and re_:
                                 st.caption(f"Count: {scnt} ({rs} → {re_})")
                         if pcnt is not None: st.caption(f"Paid: {pcnt}")
-
                         # show receipt preview if present (dropoff)
                         if mtype=="dropoff_report" and meta:
                             try:
@@ -632,79 +539,18 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                                     st.image(rp, caption="Receipt", use_column_width=True)
                             except Exception:
                                 pass
-
-                        # Attachments (inline)
-                        atts = _attachments_from_meta(meta)
-                        if atts:
-                            with st.container():
-                                st.caption("Attachments:")
-                                for p in atts[:10]:
-                                    try:
-                                        ext = Path(p).suffix.lower()
-                                        if Path(p).exists() and ext in (".jpg",".jpeg",".png",".gif",".webp"):
-                                            st.image(p, use_column_width=True)
-                                        elif Path(p).exists() and ext == ".pdf":
-                                            st.download_button("Download PDF", Path(p).read_bytes(), file_name=Path(p).name, key=f"dl_{_id}_{Path(p).name}")
-                                        elif Path(p).exists():
-                                            st.download_button("Download file", Path(p).read_bytes(), file_name=Path(p).name, key=f"dl_{_id}_{Path(p).name}")
-                                        else:
-                                            st.caption(f"Missing file: {p}")
-                                    except Exception:
-                                        st.caption(f"Could not render: {p}")
                         st.divider()
-
-                    cols = st.columns([1,1,2,2,3])
+                    cols = st.columns([1,2,2])
                     if cols[0].button("Mark read", key=f"mr_{tid}"):
                         mark_thread_read(current_user, tid); st.rerun()
-
-                    # Archive / unarchive per recipient (this user)
-                    if not is_archived and cols[1].button("Archive", key=f"ar_{tid}"):
-                        archive_thread(current_user, tid, True); st.rerun()
-                    if is_archived and cols[1].button("Unarchive", key=f"unar_{tid}"):
-                        archive_thread(current_user, tid, False); st.rerun()
-
-                    reply = cols[2].text_input("Reply", key=f"r_{tid}")
-                    # Reply-all option (send to all Admins) if the user is NOT admin,
-                    # or if this is a weekly/dropoff thread.
-                    reply_all_hq_allowed = (not is_admin_user) or any(i[7] in ("weekly_dropoffs","dropoff_report") for i in items)
-                    reply_all = cols[3].checkbox("Reply to all HQ", value=reply_all_hq_allowed and (items[0][7] in ("weekly_dropoffs","dropoff_report")), key=f"ra_{tid}", disabled=not reply_all_hq_allowed)
-
-                    # Attachments on reply
-                    up_files = cols[4].file_uploader("Attach files", type=["jpg","jpeg","png","gif","webp","pdf"], accept_multiple_files=True, key=f"up_{tid}")
-
-                    if st.button("Send", key=f"s_{tid}") and reply.strip():
+                    reply = cols[1].text_input("Reply", key=f"r_{tid}", max_chars=MESSAGE_BODY_MAX)
+                    if cols[1].button("Send", key=f"s_{tid}") and reply.strip():
+                        to = latest[2] if latest[2]!=current_user else latest[3]
                         try:
-                            # Determine recipients
-                            recips: List[str] = []
-                            if reply_all and reply_all_hq_allowed:
-                                recips = [u[0] for u in query("SELECT username FROM users WHERE LOWER(role)='admin'")]
-                                recips = [r for r in recips if r != current_user]
-                            else:
-                                to = latest[2] if latest[2]!=current_user else latest[3]
-                                recips = [to]
-
-                            # Save attachments (if any)
-                            paths = _save_message_attachments(up_files)
-
-                            sent_ok = 0
-                            for rcp in recips:
-                                send_message(
-                                    current_user, rcp, subject=latest[4], body=reply.strip(),
-                                    msg_type="message", thread_id=tid, hub=hub, attachments=paths
-                                )
-                                sent_ok += 1
-
-                            # Mark this recipient's thread read
+                            send_message(current_user, to, subject=latest[4], body=reply, msg_type="message", thread_id=tid, hub=hub)
+                            # Auto-mark as read on reply
                             mark_thread_read(current_user, tid)
-
-                            # If admin replied, optionally mark all inbox copies read for everyone in the thread
-                            if is_admin_user:
-                                try:
-                                    mark_thread_read_for_all_inbox_recipients(tid)
-                                except Exception:
-                                    pass
-
-                            st.success(f"Reply sent to {sent_ok} recipient(s)."); st.rerun()
+                            st.success("Reply sent."); st.rerun()
                         except ValueError as e:
                             st.error(str(e))
 
@@ -715,15 +561,10 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
             if not sent:
                 st.info("No sent messages.")
             else:
-                df = pd.DataFrame(sent, columns=[
-                    "id","timestamp","sender","recipient","subject","body","thread_id",
-                    "msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count","meta","archived_at"
-                ])
+                df = pd.DataFrame(sent, columns=["id","timestamp","sender","recipient","subject","body","thread_id","msg_type","read_at","hub","shipped_count","range_start","range_end","paid_count","meta"])
                 if not df.empty:
                     df["timestamp"] = df["timestamp"].apply(fmt_et)
-                st.dataframe(df, use_container_width=True, height=420)
-                st.download_button("Export sent.csv", df.to_csv(index=False).encode("utf-8"),
-                                   "sent.csv", "text/csv")
+                st.dataframe(df, use_container_width=True, height=400)
 
     # --- compose / message HQ ---
     compose_tab = tabs[2] if is_admin_user else tabs[1]
@@ -748,19 +589,17 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                 st.caption("This message will be sent to **HQ (all Admins)**.")
                 recips = admins
 
-        subject = st.text_input("Subject")
-        body = st.text_area("Message")
-        new_files = st.file_uploader("Attachments (optional)", type=["jpg","jpeg","png","gif","webp","pdf"], accept_multiple_files=True)
+        subject = st.text_input("Subject", max_chars=MESSAGE_SUBJECT_MAX)
+        body = st.text_area("Message", max_chars=MESSAGE_BODY_MAX)
         send_disabled = (not subject.strip()) or (not body.strip()) or (not recips)
         if st.button("Send message", disabled=send_disabled):
             if not recips:
                 st.warning("No recipients.")
             else:
-                paths = _save_message_attachments(new_files)
                 ok = 0; err = 0
                 for r in recips:
                     try:
-                        send_message(current_user, r, subject, body, hub=hub, attachments=paths)
+                        send_message(current_user, r, subject, body, hub=hub)
                         ok += 1
                     except ValueError:
                         err += 1
@@ -770,6 +609,20 @@ def messaging_page(current_user: str, role: str, hub: Optional[str]):
                     st.error(f"{err} message(s) blocked by policy.")
 
 # ===== section 5: main UI, schemas, admin/hub/supplier pages ==================
+def ensure_logs_schema():
+    con = connect(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        user TEXT,
+        sku TEXT,
+        hub TEXT,
+        action TEXT,
+        qty INTEGER,
+        comment TEXT
+    )""")
+    con.commit(); con.close()
+
 def ensure_shipments_schema():
     con = connect(); cur = con.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS shipments (
@@ -801,15 +654,6 @@ def _table_exists(name: str) -> bool:
     con.close()
     return ok
 
-# NEW: guard index creation by checking column existence
-def _column_exists(table: str, column: str) -> bool:
-    con = connect(); cur = con.cursor()
-    try:
-        cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
-        return column in cols
-    finally:
-        con.close()
-
 def create_indices():
     con = connect(); cur = con.cursor()
     try:
@@ -819,9 +663,6 @@ def create_indices():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(msg_type)")
-            # Guard this with column existence (prevents startup crash)
-            if _column_exists("messages", "archived_at"):
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_arch ON messages(recipient, archived_at)")
         if _table_exists("logs"):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp)")
         if _table_exists("shipments"):
@@ -832,10 +673,9 @@ def create_indices():
 
 ensure_logs_schema()
 ensure_shipments_schema()
-ensure_messages_schema()   # ensure messages + migrations (adds archived_at) before indexing
-create_indices()           # first attempt (guarded)
+create_indices()  # first attempt (guarded)
 
-# --- Home helpers (admin/hub) -------------------------------------------------
+# --- Admin Overview -----------------------------------------------------------
 ADMIN_LOW_STOCK = 5
 LOW_STOCK_THRESHOLD = 5
 
@@ -929,7 +769,7 @@ def list_backups(limit: int = 50) -> List[Path]:
     p = Path(DB).with_name(f"{Path(DB).stem}-*{Path(DB).suffix}")
     return sorted(Path(DB).parent.glob(p.name), reverse=True)[:limit]
 
-# --- Admin Overview -----------------------------------------------------------
+# --- Admin Overview helpers ---------------------------------------------------
 def _admin_kpis() -> Dict[str, int]:
     tqty = query("SELECT COALESCE(SUM(quantity),0) FROM inventory")
     total_qty = int(tqty[0][0]) if tqty else 0
@@ -989,9 +829,27 @@ def _admin_dropoffs_summary(start: date, end: date, hub: Optional[str]) -> int:
     r = query(sql, tuple(params))
     return int(r[0][0]) if r else 0
 
+# --- Cached wrappers (no schema change) ---------------------------------------
+@st.cache_data(ttl=30)
+def cached_admin_kpis():
+    return _admin_kpis()
+
+@st.cache_data(ttl=30)
+def cached_hubs_overview_df():
+    return _hubs_overview_df()
+
+@st.cache_data(ttl=30)
+def cached_low_stock_all_df():
+    return _low_stock_all_df()
+
+@st.cache_data(ttl=30)
+def cached_shipments_overview_df(days: int = 30):
+    return _shipments_overview_df(days)
+
+# --- Admin pages --------------------------------------------------------------
 def admin_home_page():
     st.subheader("Admin Overview")
-    k = _admin_kpis()
+    k = cached_admin_kpis()
     kcols = st.columns(4)
     kcols[0].metric("Total SKUs", k["total_skus"])
     kcols[1].metric("On-hand pieces", k["total_qty"])
@@ -1002,14 +860,14 @@ def admin_home_page():
     t1, t2 = st.tabs(["🏬 Hubs overview", "⚠️ Low stock (all hubs)"])
 
     with t1:
-        dfh = _hubs_overview_df()
+        dfh = cached_hubs_overview_df()
         if not dfh.empty:
             st.dataframe(dfh, use_container_width=True, hide_index=True)
         else:
             st.info("No hub data yet.")
 
     with t2:
-        dfl = _low_stock_all_df()
+        dfl = cached_low_stock_all_df()
         if dfl.empty:
             st.success("No low-stock items across hubs.")
         else:
@@ -1023,7 +881,7 @@ def admin_home_page():
 
     st.divider()
     st.subheader("📦 Shipments (last 30 days)")
-    dfs = _shipments_overview_df(30)
+    dfs = cached_shipments_overview_df(30)
     if dfs.empty:
         st.info("No shipments in the last 30 days.")
     else:
@@ -1184,7 +1042,7 @@ def admin_page(role: str):
     st.header("🛠️ Admin")
     tabs = st.tabs(["🏷️ Catalog", "📸 Receipts", "📊 Reports", "💽 Backups", "📥 CSV Restore"])
 
-    # --- Catalog tab (add/assign SKUs to hubs) ---
+    # --- Catalog tab (add / assign SKUs to hubs) ---
     with tabs[0]:
         st.subheader("Catalog (Add / Assign SKUs)")
         hubs_known = _hubs_list()
@@ -1338,12 +1196,41 @@ def _hub_top5_df(hub: str) -> pd.DataFrame:
     """, (hub,))
     return pd.DataFrame(rows, columns=["SKU","Qty"])
 
+# cached wrappers for hub pages
+@st.cache_data(ttl=30)
+def cached_hub_kpis(hub: str):
+    return _hub_kpis(hub)
+
+@st.cache_data(ttl=30)
+def cached_recent_shipments_df(hub: str, days: int = 90):
+    return _recent_shipments_df(hub, days)
+
+@st.cache_data(ttl=30)
+def cached_hub_top5_df(hub: str):
+    return _hub_top5_df(hub)
+
 def _save_receipt_file(username: str, hub: str, file) -> Optional[str]:
     try:
+        # size guard (no DB impact)
+        fsize = None
+        try:
+            fsize = getattr(file, "size", None)
+        except Exception:
+            fsize = None
+        if fsize is None:
+            try:
+                fsize = len(file.getvalue())
+            except Exception:
+                fsize = None
+        if fsize is not None and fsize > UPLOAD_MAX_BYTES:
+            return None  # too large; caller can warn
+
+        from secrets import token_hex
         ts = et_now_dt().strftime("%Y%m%d-%I%M%S%p")
-        safe_hub = hub.replace("/", "_")
-        name = f"{username}_{safe_hub}_{ts}"
-        suffix = Path(file.name).suffix.lower() if hasattr(file, "name") else ".jpg"
+        safe_hub = (hub or "hub").replace("/", "_")
+        rand = token_hex(4)
+        name = f"{username}_{safe_hub}_{ts}_{rand}"
+        suffix = Path(getattr(file, "name", "receipt.jpg")).suffix.lower()
         if suffix not in (".jpg",".jpeg",".png",".pdf",".gif",".webp"):
             suffix = ".jpg"
         path = DROP_DIR / f"{name}{suffix}"
@@ -1477,7 +1364,7 @@ def hub_home_page(username: str, hub: Optional[str]):
 
     # --- Dashboard ---
     with tabs[0]:
-        k = _hub_kpis(hub)
+        k = cached_hub_kpis(hub)
         kcols = st.columns(4)
         kcols[0].metric("SKUs stocked", k["skus"])
         kcols[1].metric("On-hand pieces", k["qty"])
@@ -1495,7 +1382,7 @@ def hub_home_page(username: str, hub: Optional[str]):
 
         st.divider()
         st.subheader("📦 Incoming Shipments")
-        sdf = _recent_shipments_df(hub, days=90)
+        sdf = cached_recent_shipments_df(hub, days=90)
         if sdf.empty:
             st.info("No recent shipments.")
         else:
@@ -1533,6 +1420,8 @@ def hub_home_page(username: str, hub: Optional[str]):
                 st.warning("Enter a drop-off count > 0.")
             else:
                 rpath = _save_receipt_file(username, hub, receipt) if receipt else None
+                if receipt and not rpath:
+                    st.warning("Receipt not attached (file too large or invalid type). Max size is ~6MB.")
                 meta = json.dumps({"receipt_path": rpath}) if rpath else None
                 subj = f"[DROPOFF] {hub} {d_date.isoformat()} — {int(d_cnt)} orders"
                 body = note or f"{hub}: dropped off {int(d_cnt)} orders on {d_date.isoformat()}"
@@ -1589,7 +1478,7 @@ def hub_home_page(username: str, hub: Optional[str]):
 
         st.divider()
         st.markdown("**Top 5 SKUs by on-hand (current)**")
-        t5 = _hub_top5_df(hub)
+        t5 = cached_hub_top5_df(hub)
         st.dataframe(t5, use_container_width=True, height=220)
         st.download_button("Export top5.csv", t5.to_csv(index=False).encode("utf-8"), "top5.csv", "text/csv")
 
@@ -1895,8 +1784,7 @@ def seed_sku_inventory_if_empty():
 
 ensure_sku_inventory_schemas()
 seed_sku_inventory_if_empty()
-ensure_messages_schema()  # ensure messaging schema exists here too
-create_indices()          # run again now that tables exist
+create_indices()  # run again now that tables exist
 
 # ===== Section 7: Inventory (clean Hubs UI + list + IN/OUT + transfer + count)
 def _hub_stats() -> pd.DataFrame:
@@ -1907,6 +1795,10 @@ def _hub_stats() -> pd.DataFrame:
         ORDER BY hub
     """)
     return pd.DataFrame(rows, columns=["hub", "sku_count", "total_qty"])
+
+@st.cache_data(ttl=30)
+def cached_hub_stats():
+    return _hub_stats()
 
 def _hubs_list() -> List[str]:
     rows = query("""
@@ -1939,7 +1831,7 @@ def _format_hub_option(opt: str, stats: Dict[str, Tuple[int, int]]) -> str:
     return opt
 
 def render_hub_selector(username: str, role: str, user_hub: Optional[str]) -> Tuple[Optional[str], str]:
-    stats_df = _hub_stats()
+    stats_df = cached_hub_stats()
     stats = {r.hub: (int(r.sku_count), int(r.total_qty)) for _, r in stats_df.iterrows()}
     opts = _hub_options_for(role, user_hub)
     if not opts:
@@ -2140,7 +2032,7 @@ def main():
     st.caption(f"NY time: {et_now_dt().strftime('%a %b %d, %I:%M %p ET')}")
     st.caption(APP_TAGLINE)
 
-    # auth gate
+    # ---- auth gate ----
     user = st.session_state.get("auth_user")
     if not user:
         login_form()
